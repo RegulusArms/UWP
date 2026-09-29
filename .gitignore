@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# User data. UWP normally keeps these outside the repo
+# (~/.config/uwp, ~/.cache/uwp, GNOME's dconf for shortcuts), but never
+# commit them if they get copied or redirected here.
+config.json
+config.json.tmp
+*.log
+thumbs/
+cache/
+.config/
+.cache/
+dconf-*.txt
+*.dconf
+
+# Personal wallpapers / test media. The app's own icons live in
+# uwp/icons and are re-included below.
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.bmp
+*.gif
+*.tif
+*.tiff
+*.avif
+*.heic
+*.jxl
+*.mp4
+*.mkv
+*.webm
+*.mov
+*.avi
+*.m4v
+*.wmv
+*.flv
+*.ogv
+*.mpg
+*.mpeg
+*.svg
+!uwp/icons/*.svg
+!docs/*.png
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Tooling
+.claude/

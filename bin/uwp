@@ -1,0 +1,51 @@
+#!/bin/sh
+# Launcher: always use the system Python (it has the GTK/GStreamer bindings).
+HERE="$(dirname "$(readlink -f "$0")")"
+
+# Started from a snap app's terminal (e.g. the VS Code snap)? Drop the paths
+# the snap injects, or GTK/GIO load the snap's modules and GSettings writes
+# (used for keyboard shortcuts) silently go nowhere.
+if [ -n "$SNAP" ]; then
+    unset GDK_PIXBUF_MODULE_FILE GDK_PIXBUF_MODULEDIR GTK_PATH GTK_EXE_PREFIX \
+          GTK_IM_MODULE_FILE GIO_MODULE_DIR GSETTINGS_SCHEMA_DIR LOCPATH
+    [ -n "$XDG_DATA_DIRS_VSCODE_SNAP_ORIG" ] && \
+        export XDG_DATA_DIRS="$XDG_DATA_DIRS_VSCODE_SNAP_ORIG"
+    [ -n "$XDG_CONFIG_DIRS_VSCODE_SNAP_ORIG" ] && \
+        export XDG_CONFIG_DIRS="$XDG_CONFIG_DIRS_VSCODE_SNAP_ORIG"
+    for v in $(env | sed -n 's/^\(SNAP[A-Z_]*\)=.*/\1/p'); do unset "$v"; done
+fi
+
+export PYTHONPATH="$HERE/..${PYTHONPATH:+:$PYTHONPATH}"
+export UWP_LAUNCHER="$(readlink -f "$0")"
+
+# --foreground keeps UWP attached to this terminal (for debugging).
+if [ "$1" = "--foreground" ]; then
+    shift
+    exec /usr/bin/python3 -m uwp "$@"
+fi
+case " $* " in
+    *" --help "*|*" -h "*|*" --help-all "*) exec /usr/bin/python3 -m uwp "$@" ;;
+esac
+
+running() {
+    gdbus call --session --dest org.freedesktop.DBus \
+        --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.NameHasOwner io.github.RegulusArms.UWP \
+        2>/dev/null | grep -q true
+}
+
+if running; then
+    # Just a message to the running instance; returns immediately.
+    exec /usr/bin/python3 -m uwp "$@"
+fi
+
+case " $* " in
+    *" --quit "*) echo "uwp is not running"; exit 0 ;;
+esac
+
+# Not running yet: start it in its own session so closing this terminal
+# (SIGHUP) doesn't take it down. Output goes to a log instead of the tty.
+LOG="${XDG_CACHE_HOME:-$HOME/.cache}/uwp/uwp.log"
+mkdir -p "$(dirname "$LOG")"
+setsid /usr/bin/python3 -m uwp "$@" >"$LOG" 2>&1 </dev/null &
+echo "uwp started (log: $LOG)"
