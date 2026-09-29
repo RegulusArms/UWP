@@ -8,6 +8,7 @@ decoded.
 """
 import ctypes
 import os
+import threading
 import warnings
 
 import cairo
@@ -18,6 +19,12 @@ gi.require_version('GdkX11', '3.0')
 from gi.repository import GdkX11  # noqa: E402,F401  (enables get_xid)
 
 from . import media, transform, xstack
+
+def log(msg):
+    """Timestamped line in ~/.cache/uwp/uwp.log (stdout when detached)."""
+    import time
+    print(time.strftime('%H:%M:%S ') + msg, flush=True)
+
 
 GST_PLAY_FLAG_VIDEO = 0x1
 GST_PLAY_FLAG_NATIVE_VIDEO = 0x40   # keep hw-decoded frames off the CPU
@@ -165,6 +172,16 @@ class VideoView:
         # Seamless looping via segment seeks: the pipeline is never rebuilt,
         # so short clips don't churn decoders or memory.
         self._segment_started = False
+        # Slideshows: stop after this many plays of the loop section and
+        # call on_finished (0 = loop forever). The last frame stays shown.
+        self.max_plays = 0
+        self.plays_done = 0
+        self.on_finished = None
+        self.finished = False         # holding the last frame on purpose
+        self.name = os.path.basename(wp['path'])
+        self._last_pos = None
+        self._stuck = 0
+        self._watch_id = GLib.timeout_add_seconds(1, self._watchdog)
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
         self._bus_ids = [
@@ -174,9 +191,33 @@ class VideoView:
             bus.connect('message::error', self._on_error)]
 
     def start(self):
+        speed, start, end = transform.playback(self.wp)
+        log(f'video start: {self.name} section {start:g}-'
+            f'{end if end else "end"} speed {speed:g}'
+            f'{" (paused)" if self.paused else ""}')
         self.pipeline.set_state(
             Gst.State.PAUSED if self.paused else Gst.State.PLAYING)
         return False
+
+    def _watchdog(self):
+        """Recover if playback silently stops advancing (every second)."""
+        if self.paused or self.finished or not self._segment_started:
+            self._last_pos, self._stuck = None, 0
+            return True
+        ok, pos = self.pipeline.query_position(Gst.Format.TIME)
+        if not ok or pos != self._last_pos:
+            self._last_pos, self._stuck = (pos if ok else None), 0
+            return True
+        self._stuck += 1
+        if self._stuck >= 3:
+            state = self.pipeline.get_state(0)[1].value_nick
+            log(f'video STALL: {self.name} stuck at {pos / 1e9:.2f}s '
+                f'(state {state}); restarting loop section')
+            self._stuck = 0
+            self.plays_done = 0
+            self.pipeline.set_state(Gst.State.PLAYING)
+            self._seek_start(Gst.SeekFlags.FLUSH)
+        return True
 
     def _on_caps(self, pad, _pspec):
         caps = pad.get_current_caps()
@@ -209,6 +250,8 @@ class VideoView:
             return
         if new[1:] != old[1:]:
             # Loop section changed: restart at its beginning.
+            self.plays_done = 0
+            self.finished = False
             self._seek_start(Gst.SeekFlags.FLUSH)
         else:
             # Speed only: carry on from the current frame.
@@ -235,29 +278,59 @@ class VideoView:
             self._segment_started = True
             self._seek_start(Gst.SeekFlags.FLUSH)
 
+    def _play_ended(self):
+        """True if the play count is used up (and reports it)."""
+        self.plays_done += 1
+        if self.plays_done <= 3:
+            log(f'video loop {self.plays_done}: {self.name}')
+        if self.max_plays and self.plays_done >= self.max_plays:
+            self.finished = True
+            if self.on_finished:
+                self.on_finished()
+            return True
+        return False
+
     def _on_segment_done(self, _bus, _msg):
-        self._seek_start(Gst.SeekFlags.NONE)
+        if not self._play_ended():
+            self._seek_start(Gst.SeekFlags.NONE)
 
     def _on_eos(self, _bus, _msg):
         # Only reached if segment seeking isn't supported by the demuxer.
-        self._seek_start(Gst.SeekFlags.FLUSH)
+        log(f'video EOS (no segment-done): {self.name}')
+        if not self._play_ended():
+            self._seek_start(Gst.SeekFlags.FLUSH)
 
     def _on_error(self, _bus, msg):
         err, dbg = msg.parse_error()
-        print(f"uwp: video error ({self.wp['path']}): {err.message}\n{dbg}")
+        log(f"video ERROR: {self.name}: {err.message}\n{dbg}")
 
     def pause(self, paused):
         if paused != self.paused:
             self.paused = paused
+            log(f'video {"paused" if paused else "resumed"}: {self.name}')
             self.pipeline.set_state(
                 Gst.State.PAUSED if paused else Gst.State.PLAYING)
 
-    def stop(self):
+    def stop(self, done=None):
+        """Tear the pipeline down on a worker thread: going to NULL can
+        block for over a second (decoder/GL context teardown), which would
+        freeze the UI and any running transition. done() runs on the main
+        loop afterwards."""
         bus = self.pipeline.get_bus()
         for i in self._bus_ids:
             bus.disconnect(i)
         bus.remove_signal_watch()
-        self.pipeline.set_state(Gst.State.NULL)
+        self.on_finished = None
+        if self._watch_id:
+            GLib.source_remove(self._watch_id)
+            self._watch_id = 0
+        pipeline = self.pipeline
+
+        def work():
+            pipeline.set_state(Gst.State.NULL)
+            if done:
+                GLib.idle_add(lambda: done() and False)
+        threading.Thread(target=work, daemon=True).start()
 
 
 class MonitorWindow(Gtk.Window):
@@ -308,14 +381,22 @@ class MonitorWindow(Gtk.Window):
             self.add(self.view)
             self.show_all()
 
-    def clear(self):
-        if self.view:
-            self.view.stop()
+    def clear(self, done=None):
+        """Drop the current view. done() runs once it has fully stopped
+        (videos stop asynchronously)."""
+        view = self.view
+        if view:
             child = self.get_child()
             if child:
                 self.remove(child)
             self.view = None
             self.path = None
+            if isinstance(view, VideoView):
+                view.stop(done)
+                return
+            view.stop()
+        if done:
+            done()
 
     def pause(self, paused):
         if self.view:
@@ -324,12 +405,51 @@ class MonitorWindow(Gtk.Window):
     def is_video(self):
         return isinstance(self.view, VideoView)
 
+    # Output interface shared with slideshow.SlideshowPlayer.
+    kind = 'single'
+
+    def show_wp(self, wp, keep=False):
+        self.set_wallpaper(wp, keep)
+
+    def stack_windows(self):
+        """Our windows, top to bottom."""
+        return [self]
+
+    def destroy_output(self):
+        # Hide now; destroy only after the video pipeline stopped drawing
+        # into this window.
+        self.hide()
+        self.clear(done=self.destroy)
+
+    def set_clip(self, x, y, w, h):
+        """Show only this rectangle of the window (wipe transitions);
+        None for x clears the clip."""
+        gw = self.get_window()
+        if gw is None:
+            return
+        if x is None:
+            gw.shape_combine_region(None, 0, 0)
+        else:
+            gw.shape_combine_region(cairo.Region(cairo.RectangleInt(
+                int(x), int(y), max(0, int(w)), max(0, int(h)))), 0, 0)
+
+
+def entry_valid(wp):
+    """A monitor entry that can be shown: an existing file, or a slideshow
+    with at least one existing file."""
+    if not wp:
+        return False
+    if wp.get('type') == 'slideshow':
+        return any(os.path.exists(i.get('path', ''))
+                   for i in wp.get('items', []))
+    return os.path.exists(wp.get('path', ''))
+
 
 class Desktop:
     """Owns the per-monitor windows and applies profiles to them."""
 
     def __init__(self):
-        self.windows = {}        # monitor key -> MonitorWindow
+        self.windows = {}        # monitor key -> MonitorWindow/SlideshowPlayer
         self.profile = None
         self.user_paused = False
         self.covered = set()
@@ -346,24 +466,36 @@ class Desktop:
             m = mons.get(key)
             geom = lambda d: (d['x'], d['y'], d['w'], d['h'], d['scale'])
             if m is None or geom(m) != geom(win.mon):
-                win.clear()
-                win.destroy()
+                win.destroy_output()
                 del self.windows[key]
         for key, m in mons.items():
             wp = profile['monitors'].get(key)
-            if wp and os.path.exists(wp['path']):
-                win = self.windows.get(key)
+            win = self.windows.get(key)
+            if entry_valid(wp):
+                kind = ('slideshow' if wp.get('type') == 'slideshow'
+                        else 'single')
+                if win is not None and win.kind != kind:
+                    win.destroy_output()
+                    win = None
                 if win is None:
-                    win = self.windows[key] = MonitorWindow(m)
-                    win.connect('map-event',
-                                lambda *_: self.stack.schedule() and False)
-                win.set_wallpaper(wp, keep=preview)
-            elif key in self.windows:
-                win = self.windows.pop(key)
-                win.clear()
-                win.destroy()
+                    win = self.windows[key] = self._new_output(kind, m)
+                win.show_wp(wp, keep=preview)
+            elif win is not None:
+                self.windows.pop(key).destroy_output()
         self._update_pause()
         self.stack.schedule()
+
+    def _new_output(self, kind, mon):
+        if kind == 'slideshow':
+            from .slideshow import SlideshowPlayer
+            return SlideshowPlayer(mon, self)
+        win = MonitorWindow(mon)
+        self.watch_map(win)
+        return win
+
+    def watch_map(self, win):
+        """Re-check stacking whenever one of our windows gets mapped."""
+        win.connect('map-event', lambda *_: self.stack.schedule() and False)
 
     def reapply(self):
         if self.profile:
@@ -374,7 +506,11 @@ class Desktop:
         self._update_pause()
 
     def set_covered(self, keys):
-        self.covered = set(keys)
+        keys = set(keys)
+        if keys != self.covered:
+            log('monitors covered by a maximized/fullscreen window '
+                f'(videos pause there): {", ".join(sorted(keys)) or "none"}')
+        self.covered = keys
         self._update_pause()
 
     def _update_pause(self):
@@ -387,8 +523,7 @@ class Desktop:
 
     def shutdown(self):
         for win in self.windows.values():
-            win.clear()
-            win.destroy()
+            win.destroy_output()
         self.windows.clear()
 
 
@@ -430,13 +565,19 @@ class StackKeeper:
         return True
 
     def _ours(self):
-        return {win.get_window().get_xid()
-                for win in self.desktop.windows.values()
-                if win.get_window() is not None and win.get_mapped()}
+        """xids of our mapped windows in the wanted order, top to bottom."""
+        out = []
+        for output in self.desktop.windows.values():
+            for win in output.stack_windows():
+                if win.get_window() is not None and win.get_mapped():
+                    out.append(win.get_window().get_xid())
+        return out
 
     def _check(self):
         # Mutter ignores plain XLowerWindow from our never-focused windows,
-        # so restack with the EWMH pager message instead.
+        # so restack with the EWMH pager message instead. Lowering each
+        # window to the bottom in top-to-bottom order leaves them in that
+        # order, all underneath the desktop-icon windows.
         self._pending = 0
         ours = self._ours()
         if not ours:
@@ -444,17 +585,21 @@ class StackKeeper:
         if self.screen is None:
             xstack.lower(ours)
             return False
-        # Bottom-to-top; any foreign desktop window under one of ours means
-        # we must drop ours to the bottom again.
+        wanted = set(ours)
+        actual = []                  # our xids, bottom to top
         foreign_below = False
         for w in self.screen.get_windows_stacked():
             xid = w.get_xid()
-            if xid in ours:
+            if xid in wanted:
                 if foreign_below:
                     xstack.lower(ours)
-                    break
+                    return False
+                actual.append(xid)
             elif w.get_window_type() == self.Wnck.WindowType.DESKTOP:
                 foreign_below = True
+        expected = [x for x in reversed(ours) if x in actual]
+        if actual != expected:
+            xstack.lower(ours)
         return False
 
 

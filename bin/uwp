@@ -16,6 +16,7 @@ if [ -n "$SNAP" ]; then
 fi
 
 export PYTHONPATH="$HERE/..${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONUNBUFFERED=1
 export UWP_LAUNCHER="$(readlink -f "$0")"
 
 # --foreground keeps UWP attached to this terminal (for debugging).

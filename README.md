@@ -14,6 +14,12 @@ the GPU for decoding and transforms so it stays light on CPU.
   you edit. OK keeps them, Cancel restores the old wallpapers.
 - **Video controls**: playback speed from 0.1× to 4×, and loop a chosen section
   (two-handle timeline or exact times, with start/end frame previews).
+- **Slideshows**: any mix of photos and videos per monitor. Each item keeps
+  its own placement, speed and loop section. Photos show for a set time
+  (per item or a default), and videos play their full length or loop section
+  a chosen number of times. Transitions: crossfade, fade through black,
+  wipes (left, right, up, down), cut or random, with an adjustable
+  length. Shuffle is optional.
 - **Profiles**: save whole-desktop setups and switch between them from the
   top bar or with a global keyboard shortcut (next, previous, or a specific
   profile).
