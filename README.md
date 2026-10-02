@@ -33,9 +33,10 @@ the GPU for decoding and transforms so it stays light on CPU.
 
 ## Requirements
 
-- Ubuntu 24.04 LTS with GNOME on **X11** (the "Ubuntu on Xorg" login option).
-  Wayland is untested: UWP forces XWayland, but desktop-window stacking and
-  the pause-when-covered check rely on X11.
+- Ubuntu 24.04 LTS or later with GNOME, on **X11 or Wayland**. Ubuntu
+  26.04 is Wayland-only; there UWP runs through XWayland automatically, so it
+  draws and plays video the same way in both sessions. See
+  [Known limitations](#known-limitations) for what differs on Wayland.
 - The Ubuntu AppIndicator extension (enabled by default on Ubuntu) for the
   top-bar icon.
 - `install.sh` installs any missing packages with apt: GTK 3 and GStreamer
@@ -76,12 +77,30 @@ uwp --open               open the settings window
 uwp --background         start in the top bar only
 uwp --next-profile       switch to the next profile (also --prev-profile)
 uwp --profile NAME       switch to a profile by name or id
+uwp --set-wallpaper PATH add PATH to the library and show it on every
+                         monitor as a new profile, then open the window
+uwp --add-to-selected PATH
+                         add PATH to the library and put it on the monitors
+                         selected in the open window (unsaved until OK)
 uwp --quit               stop UWP
 uwp --foreground ...     run attached to the terminal (debugging)
 ```
 
 The first `uwp` starts the app detached from the terminal, so closing the
 terminal won't stop it. Later calls talk to the running instance.
+
+### Using UWP from other apps
+
+`--set-wallpaper` and `--add-to-selected` are also D-Bus actions
+(`set-wallpaper` and `add-to-selected`, each taking the file path as a string)
+on `io.github.RegulusArms.UWP` at `/io/github/RegulusArms/UWP`, through the
+standard `org.gtk.Actions` interface. `add-to-selected` is enabled only while
+the settings window is open, so another app can check whether it's available
+(`org.gtk.Actions.Describe`) before offering it.
+
+The [Kestrel](https://github.com/RegulusArms/kestrel-explorer) file manager
+uses these for its "Set as Wallpaper (UWP)" and "Add to Selected UWP Monitor"
+menu items.
 
 ## Where things are stored
 
@@ -97,7 +116,9 @@ Nothing personal is written into this folder:
 ## How it works
 
 - One desktop-type X11 window per monitor, kept underneath the desktop-icon
-  windows.
+  windows. Under Wayland these are XWayland windows: UWP forces GTK and
+  GStreamer onto X11 and hides `WAYLAND_DISPLAY` from its own process (apps it
+  opens get it back).
 - Images are drawn once with Cairo.
 - Videos play through GStreamer: hardware decoding, then `gltransformation`
   for scale and rotation on the GPU, then `glimagesink`. Looping uses
@@ -110,7 +131,16 @@ total.
 
 ## Known limitations
 
-- Built and tested on GNOME/X11 only.
+- Built and tested on GNOME (X11 and Wayland). Other desktops may work but
+  are untested.
+- On Wayland, "pause videos hidden behind maximized or fullscreen windows"
+  only notices X11 (XWayland) apps: GNOME doesn't list native Wayland
+  windows to other apps.
+- Profiles remember monitors by connector name (`DP-1`, `HDMI-1`...). Xorg
+  and Wayland can name the same port differently (NVIDIA's Xorg driver
+  counts `DP-0`, `DP-2`...), so on GNOME UWP also records each monitor's
+  EDID and moves profile entries to the right connector when names change.
+  Two identical monitors with the same serial can't be told apart this way.
 - Don't use Ctrl+Alt+F1–F12 or Ctrl+Alt+Backspace/Delete as shortcuts: the
   system acts on those before GNOME (for example, switching to a text
   console). UWP refuses them.

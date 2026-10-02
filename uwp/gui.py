@@ -413,6 +413,10 @@ class SettingsDialog(Gtk.Dialog):
         pause = Gtk.CheckButton(
             label='Pause videos hidden behind maximized or fullscreen windows')
         pause.set_active(edit.get('pause_when_covered', True))
+        if renderer.on_wayland():
+            pause.set_tooltip_text(
+                'On Wayland this only notices X11 (XWayland) apps; GNOME '
+                'does not show native Wayland windows to other apps.')
         pause.connect('toggled', lambda b: edit.__setitem__(
             'pause_when_covered', b.get_active()))
         grid.attach(pause, 0, row, 2, 1)
@@ -1578,7 +1582,8 @@ class WallpaperGui(Gtk.ApplicationWindow):
             lambda: self._assign(item.path, [m['key'] for m in self.monitors],
                                  replace=True))
         add('Open containing folder', lambda: subprocess.Popen(
-            ['xdg-open', os.path.dirname(item.path)]))
+            ['xdg-open', os.path.dirname(item.path)],
+            env=config.child_env()))
         menu.append(Gtk.SeparatorMenuItem())
         if item.source == item.path:
             add('Remove from library', lambda: self._remove_source(item.source))
@@ -1589,6 +1594,42 @@ class WallpaperGui(Gtk.ApplicationWindow):
         menu.attach_to_widget(self, None)
         menu.popup_at_pointer(ev)
         return True
+
+    # ---- files handed over by other apps (see app.py) ------------------
+    def library_added(self, path):
+        """The app added path to the saved library; show it here too."""
+        if path not in self.edit['library']:
+            self.edit['library'].append(path)
+            self.reload_library()
+            self.sync_controls()
+
+    def adopt_profile(self, profile):
+        """A profile was created and activated outside the editor (e.g.
+        "Set as Wallpaper" in a file manager): add it and switch to it,
+        keeping any unsaved edits to the other profiles."""
+        self.edit['profiles'].append(profile)
+        self.edit['active_profile'] = profile['id']
+        self.ss_item = None
+        self.refresh_profiles()
+        self.sync_controls()
+        self.changed()
+        self._status(f'New profile “{profile["name"]}”')
+
+    def add_to_selected(self, path):
+        """Put path on the selected monitors, as if it was clicked in the
+        library. Returns an error message or None."""
+        if not self.selected:
+            return 'Select a monitor first.'
+        self.app.add_to_library(path)
+        self._assign(path, self.selected)
+        self._select_library_item(path)
+        names = ', '.join(sorted(self.selected))
+        self._status(f'{os.path.basename(path)} → {names}. '
+                     'Press OK to keep it.')
+        return None
+
+    def show_status(self, text):
+        self._status(text)
 
     def _remove_source(self, source):
         if source in self.edit['library']:

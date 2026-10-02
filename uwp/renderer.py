@@ -13,10 +13,18 @@ import warnings
 
 import cairo
 import gi
-from gi.repository import Gdk, GLib, Gst, Gtk
+from gi.repository import Gdk, Gio, GLib, Gst, Gtk
 
 gi.require_version('GdkX11', '3.0')
 from gi.repository import GdkX11  # noqa: E402,F401  (enables get_xid)
+
+# Must load before any sink exists: once PyGObject has wrapped an element,
+# a later GstVideo import yields a method-less stub GstVideoOverlay class.
+try:
+    gi.require_version('GstVideo', '1.0')
+    from gi.repository import GstVideo  # noqa: E402
+except (ImportError, ValueError):
+    GstVideo = None
 
 from . import media, transform, xstack
 
@@ -50,11 +58,9 @@ def set_window_handle(sink, xid):
     """GstVideoOverlay.set_window_handle, via ctypes if the GstVideo
     typelib (gir1.2-gst-plugins-base-1.0) is not installed."""
     try:
-        gi.require_version('GstVideo', '1.0')
-        from gi.repository import GstVideo
         GstVideo.VideoOverlay.set_window_handle(sink, xid)
         return
-    except (ImportError, ValueError):
+    except AttributeError:
         pass
     lib = ctypes.CDLL('libgstvideo-1.0.so.0')
     fn = lib.gst_video_overlay_set_window_handle
@@ -65,10 +71,46 @@ def set_window_handle(sink, xid):
     fn(ptr, xid)
 
 
+_edid = None
+
+
+def _edid_info():
+    """{connector: (id, display name)} from mutter's EDID data, or {} when
+    not on GNOME. The id (vendor/product/serial) names the physical monitor
+    the same in Xorg and Wayland sessions, where connector names can differ
+    (NVIDIA's Xorg driver counts DP-0, DP-2...; Wayland uses DP-1, DP-2...).
+    Cached until forget_monitor_ids()."""
+    global _edid
+    if _edid is None:
+        _edid = {}
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            state = bus.call_sync(
+                'org.gnome.Mutter.DisplayConfig',
+                '/org/gnome/Mutter/DisplayConfig',
+                'org.gnome.Mutter.DisplayConfig', 'GetCurrentState',
+                None, None, Gio.DBusCallFlags.NONE, 1000, None).unpack()
+            for (conn, vendor, product, serial), _modes, _props in state[1]:
+                _edid[conn] = (f'{vendor}:{product}:{serial}',
+                               f'{vendor} {product}'.strip())
+        except GLib.Error as e:
+            log(f'monitor EDID ids unavailable ({e.message}); profiles '
+                'follow connector names only')
+    return _edid
+
+
+def forget_monitor_ids():
+    """Re-read EDID ids on the next monitors() call (after hotplug)."""
+    global _edid
+    _edid = None
+
+
 def monitors():
-    """Connected monitors as dicts with a stable 'key' (connector name)."""
+    """Connected monitors as dicts with a stable 'key' (connector name) and,
+    on GNOME, an 'id' identifying the physical monitor (see _edid_info)."""
     display = Gdk.Display.get_default()
     screen = Gdk.Screen.get_default()
+    edid = _edid_info()
     out, used = [], set()
     for i in range(display.get_n_monitors()):
         m = display.get_monitor(i)
@@ -80,11 +122,14 @@ def monitors():
         while key in used:
             key += "'"
         used.add(key)
+        mid, name = edid.get(key, (None, None))
         out.append({
-            'key': key, 'x': g.x, 'y': g.y, 'w': g.width, 'h': g.height,
+            'key': key, 'id': mid,
+            'x': g.x, 'y': g.y, 'w': g.width, 'h': g.height,
             'scale': m.get_scale_factor(), 'primary': m.is_primary(),
-            'model': ' '.join(filter(None, (m.get_manufacturer(),
-                                            m.get_model()))),
+            # XWayland reports the connector as the model; prefer EDID
+            'model': name or ' '.join(filter(None, (m.get_manufacturer(),
+                                                    m.get_model()))),
         })
     return out
 
@@ -527,6 +572,12 @@ class Desktop:
         self.windows.clear()
 
 
+def on_wayland():
+    """True in a Wayland session (we still run through XWayland)."""
+    return bool(os.environ.get('UWP_WAYLAND_DISPLAY') or
+                os.environ.get('XDG_SESSION_TYPE') == 'wayland')
+
+
 _wnck = None
 
 
@@ -606,7 +657,9 @@ class StackKeeper:
 class CoverWatcher:
     """Reports which monitors are hidden behind a fullscreen/maximized (or
     near-full-size) window on the current workspace, so their videos can be
-    paused. X11 only; silently disabled if libwnck is unavailable."""
+    paused. Uses libwnck, which only sees X11 windows: under Wayland that
+    means XWayland apps only (GNOME won't list native Wayland windows to
+    other apps). Silently disabled if libwnck is unavailable."""
 
     def __init__(self, callback):
         self.callback = callback
@@ -615,6 +668,9 @@ class CoverWatcher:
         self.Wnck, self.screen = wnck_screen()
         if self.screen is not None:
             GLib.timeout_add(1000, self._tick)
+            if on_wayland():
+                log('Wayland session: pause-when-covered only sees X11 '
+                    '(XWayland) windows')
 
     def set_enabled(self, enabled):
         self.enabled = enabled and self.screen is not None
