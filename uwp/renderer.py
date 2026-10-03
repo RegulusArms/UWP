@@ -134,45 +134,71 @@ def monitors():
     return out
 
 
+def _load_image(path, W, H, scale):
+    """(pixbuf, real w, real h). Caps decode size: enough for 3x zoom
+    without keeping a gigantic source image in memory."""
+    cap = max(W, H) * scale * 3
+    w, h = media.image_size(path)
+    pb = (media.load_image(path, cap, cap)
+          if max(w, h) > cap else media.load_image(path))
+    if pb.get_option('orientation') in ('5', '6', '7', '8'):
+        w, h = h, w
+    return pb, w or None, h or None
+
+
+def _canvas(W, H, scale):
+    surf = cairo.ImageSurface(cairo.FORMAT_RGB24, W * scale, H * scale)
+    surf.set_device_scale(scale, scale)
+    cr = cairo.Context(surf)
+    cr.set_source_rgb(0, 0, 0)
+    cr.paint()
+    return surf, cr
+
+
+def render_image(wp, W, H, scale):
+    """wp drawn onto a W x H surface (black where uncovered). Uses no GTK,
+    so slideshows call it from worker threads: decoding a large photo takes
+    most of a second and would stall every running transition."""
+    surf, cr = _canvas(W, H, scale)
+    try:
+        src, w, h = _load_image(wp['path'], W, H, scale)
+        transform.cairo_paint(cr, src, wp, W, H, w, h)
+    except GLib.Error as e:
+        print(f"uwp: cannot load {wp['path']}: {e.message}")
+    return surf
+
+
 class ImageView(Gtk.DrawingArea):
-    def __init__(self, wp, W, H, scale, keep=False):
+    def __init__(self, wp, W, H, scale, keep=False, surface=None):
         super().__init__()
         self.W, self.H, self.scale = W, H, scale
         self.surface = None
         # (path, source surface, w, h): kept only during live preview so
         # each slider tick is a repaint, not a decode from disk.
         self._src = None
-        self.update(wp, keep)
+        if surface is not None:
+            self.surface = surface
+        else:
+            self.update(wp, keep)
         self.connect('draw', self._draw)
 
-    def _load(self, path):
-        # Cap decode size: enough for 3x zoom without keeping a gigantic
-        # source image in memory.
-        cap = max(self.W, self.H) * self.scale * 3
-        w, h = media.image_size(path)
-        pb = (media.load_image(path, cap, cap)
-              if max(w, h) > cap else media.load_image(path))
-        if pb.get_option('orientation') in ('5', '6', '7', '8'):
-            w, h = h, w
-        return pb, w or None, h or None
-
     def update(self, wp, keep=False):
-        s = self.scale
-        surf = cairo.ImageSurface(cairo.FORMAT_RGB24, self.W * s, self.H * s)
-        surf.set_device_scale(s, s)
-        cr = cairo.Context(surf)
-        cr.set_source_rgb(0, 0, 0)
-        cr.paint()
+        if not keep:
+            self._src = None
+            self.surface = render_image(wp, self.W, self.H, self.scale)
+            self.queue_draw()
+            return
+        surf, cr = _canvas(self.W, self.H, self.scale)
         try:
             if self._src and self._src[0] == wp['path']:
                 _, src, w, h = self._src
             else:
-                src, w, h = self._load(wp['path'])
-                if keep:
-                    src = Gdk.cairo_surface_create_from_pixbuf(src, 1, None)
+                src, w, h = _load_image(wp['path'], self.W, self.H,
+                                        self.scale)
+                src = Gdk.cairo_surface_create_from_pixbuf(src, 1, None)
             transform.cairo_paint(cr, src, wp, self.W, self.H, w, h,
-                                  fast=keep)
-            self._src = (wp['path'], src, w, h) if keep else None
+                                  fast=True)
+            self._src = (wp['path'], src, w, h)
         except GLib.Error as e:
             self._src = None
             print(f"uwp: cannot load {wp['path']}: {e.message}")
@@ -409,9 +435,10 @@ class MonitorWindow(Gtk.Window):
         cr.paint()
         return False
 
-    def set_wallpaper(self, wp, keep=False):
+    def set_wallpaper(self, wp, keep=False, surface=None):
+        """Show wp. surface: the image already rendered (render_image)."""
         m = self.mon
-        if self.view and self.path == wp['path']:
+        if self.view and self.path == wp['path'] and surface is None:
             self.view.update(wp, keep)
             return
         self.clear()
@@ -422,7 +449,8 @@ class MonitorWindow(Gtk.Window):
             self.view = VideoView(wp, m['w'], m['h'], m['scale'], xid)
             GLib.idle_add(self.view.start)
         else:
-            self.view = ImageView(wp, m['w'], m['h'], m['scale'], keep)
+            self.view = ImageView(wp, m['w'], m['h'], m['scale'], keep,
+                                  surface)
             self.add(self.view)
             self.show_all()
 
@@ -443,7 +471,7 @@ class MonitorWindow(Gtk.Window):
         if done:
             done()
 
-    def pause(self, paused):
+    def pause(self, paused, videos_only=False):
         if self.view:
             self.view.pause(paused)
 
@@ -500,6 +528,15 @@ class Desktop:
         self.covered = set()
         self.previewing = False
         self.stack = StackKeeper(self)
+        self._clock = None
+
+    @property
+    def clock(self):
+        """The timeline all slideshows share (see slideshow.Clock)."""
+        if self._clock is None:
+            from .slideshow import Clock
+            self._clock = Clock()
+        return self._clock
 
     def apply(self, profile, preview=False):
         """Show profile. preview=True is the GUI's live preview: images keep
@@ -559,9 +596,13 @@ class Desktop:
         self._update_pause()
 
     def _update_pause(self):
+        # The user's pause stops everything. A covered monitor only pauses
+        # its videos: slideshow photos keep their timeline, so the monitor
+        # shows the right picture when it is uncovered.
         for key, win in self.windows.items():
-            win.pause(not self.previewing and
-                      (self.user_paused or key in self.covered))
+            user = not self.previewing and self.user_paused
+            covered = not self.previewing and key in self.covered
+            win.pause(user or covered, videos_only=not user)
 
     def has_video(self):
         return any(w.is_video() for w in self.windows.values())

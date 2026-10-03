@@ -19,7 +19,10 @@ the GPU for decoding and transforms so it stays light on CPU.
   (per item or a default), and videos play their full length or loop section
   a chosen number of times. Transitions: crossfade, fade through black,
   wipes (left, right, up, down), cut or random, with an adjustable
-  length. Shuffle is optional.
+  length. Shuffle is optional. Slideshows on different monitors share one
+  clock, so shows with the same timings change together. A slideshow
+  covered by a maximized or fullscreen window keeps its place: photos
+  carry on changing behind it, and only videos pause.
 - **Profiles**: save whole-desktop setups and switch between them from the
   top bar or with a global keyboard shortcut (next, previous, or a specific
   profile).

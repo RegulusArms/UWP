@@ -6,18 +6,27 @@ background). Each layer is an ordinary MonitorWindow, so items render
 exactly like single wallpapers. Transitions are done by the compositor on
 the GPU: fades animate the incoming window's opacity, wipes animate its
 clip region.
+
+All players run on one Clock, so monitors with the same timings change at
+the same moment and their transitions step on the same frames. Photos for
+the next slide are decoded in worker threads; the main loop only swaps in
+the finished picture, so no monitor's transition stalls while another
+monitor loads.
 """
 import json
+import math
 import os
 import random
+import threading
 
 from gi.repository import GLib
 
 from . import media, transform
-from .renderer import MonitorWindow, VideoView
+from .renderer import MonitorWindow, VideoView, log, render_image
 
-PRELOAD = 1.5          # seconds before a transition to load the next item
+PRELOAD = 3.0          # seconds before a transition to load the next item
 FRAME_MS = 16
+LATE = 0.1             # a transition starting later than this skips ahead
 
 _durations = {}        # path -> seconds, shared by all players
 
@@ -41,40 +50,85 @@ def show_time(show, item):
     return transform.video_plays(item) * (stop - start) / speed
 
 
-class _Timer:
-    """One-shot timer that can be paused and resumed."""
+class Clock:
+    """The timeline every slideshow shares. Events due at the same moment
+    fire in one main-loop pass, and all running transitions are stepped
+    from one frame timer with the same timestamp."""
 
-    def __init__(self, seconds, callback):
-        self.remaining = max(0.0, seconds)
-        self.callback = callback
-        self.id = 0
-        self.t0 = 0
-        self.resume()
+    def __init__(self):
+        self.epoch = self.now()
+        self._events = []        # [when, seq, callback or None]
+        self._seq = 0
+        self._timer = 0
+        self._steps = []
+        self._anim = 0
 
-    def resume(self):
-        if self.id or self.remaining is None:
+    @staticmethod
+    def now():
+        return GLib.get_monotonic_time() / 1e6
+
+    def boundary(self, period, after):
+        """The first multiple of period, counted from the epoch, later than
+        after. Shows with equal periods thus change together however far
+        apart they started."""
+        n = math.floor((after - self.epoch) / period) + 1
+        return self.epoch + n * period
+
+    def at(self, when, callback):
+        self._seq += 1
+        ev = [when, self._seq, callback]
+        self._events.append(ev)
+        self._arm()
+        return ev
+
+    def cancel(self, ev):
+        if ev is None:
             return
-        self.t0 = GLib.get_monotonic_time()
-        self.id = GLib.timeout_add(int(self.remaining * 1000), self._fire)
+        ev[2] = None             # may already be in a batch being fired
+        if ev in self._events:
+            self._events.remove(ev)
+            self._arm()
 
-    def pause(self):
-        if self.id:
-            GLib.source_remove(self.id)
-            self.id = 0
-            elapsed = (GLib.get_monotonic_time() - self.t0) / 1e6
-            self.remaining = max(0.0, self.remaining - elapsed)
-
-    def cancel(self):
-        if self.id:
-            GLib.source_remove(self.id)
-        self.id = 0
-        self.remaining = None
+    def _arm(self):
+        if self._timer:
+            GLib.source_remove(self._timer)
+            self._timer = 0
+        if self._events:
+            when = min(e[0] for e in self._events)
+            ms = max(0, math.ceil((when - self.now()) * 1000))
+            self._timer = GLib.timeout_add(ms, self._fire)
 
     def _fire(self):
-        self.id = 0
-        self.remaining = None
-        self.callback()
+        self._timer = 0
+        now = self.now()
+        due = sorted(e for e in self._events if e[0] <= now + 0.002)
+        for e in due:
+            self._events.remove(e)
+        for e in due:
+            if e[2] is not None:
+                e[2]()
+        self._arm()
         return False
+
+    def animate(self, step):
+        """Call step(now) every frame until it returns False."""
+        self._steps.append(step)
+        if not self._anim:
+            self._anim = GLib.timeout_add(FRAME_MS, self._frame)
+
+    def stop(self, step):
+        if step in self._steps:
+            self._steps.remove(step)
+
+    def _frame(self):
+        now = self.now()
+        for step in list(self._steps):
+            if step in self._steps and not step(now):
+                self._steps.remove(step)
+        if not self._steps:
+            self._anim = 0
+            return False
+        return True
 
 
 class SlideshowPlayer:
@@ -83,6 +137,7 @@ class SlideshowPlayer:
     def __init__(self, mon, desktop):
         self.mon = mon
         self.desktop = desktop
+        self.clock = desktop.clock
         self.backdrop = MonitorWindow(mon)       # plain black window
         desktop.watch_map(self.backdrop)
         self.backdrop.show_all()
@@ -94,12 +149,23 @@ class SlideshowPlayer:
         self.pos = 0                  # position in self.order
         self.sig = None               # what is currently running
         self.static = False           # holding one item (GUI preview)
-        self.timers = []
-        self.anim = 0
+        # Timeline: the next transition starts at next_at (clock time), or,
+        # while frozen, `left` seconds after it thaws. It is frozen while
+        # the user paused, or while the item whose time is running is a
+        # video and videos are paused (e.g. the monitor is covered).
+        self.next_at = None
+        self.left = None
+        self.timeline_video = False
+        self.ev_prepare = None
+        self.ev_begin = None
+        self.anim = None              # running transition step
         self.prepared = None          # item index loaded in the other layer
+        self.loading = False          # a worker is rendering the next photo
+        self.want_prepare = False     # preload came due during a transition
+        self.begin_at = None          # transition waiting for the preload
         self.transition = None
-        self.played = 0.0             # seconds the current item already ran
-        self.paused = False
+        self.hold_videos = False
+        self.hold_all = False
         self.gen = 0                  # invalidates stale callbacks
 
     def _new_layer(self):
@@ -129,13 +195,16 @@ class SlideshowPlayer:
         incoming = self.layers[1 - self.cur]
         return [incoming, self.layers[self.cur], self.backdrop]
 
-    def pause(self, paused):
-        self.paused = paused
-        for t in self.timers:
-            t.pause() if paused else t.resume()
+    def pause(self, paused, videos_only=False):
+        """videos_only: pause videos but keep the photo timeline running
+        (monitor covered by a window), rather than freeze the whole show
+        (the user's pause)."""
+        self.hold_videos = paused
+        self.hold_all = paused and not videos_only
         self.layers[self.cur].pause(paused)
         if self.anim:
             self.layers[1 - self.cur].pause(paused)
+        self._update_frozen()
 
     def is_video(self):
         return any(layer.is_video() for layer in self.layers)
@@ -145,16 +214,68 @@ class SlideshowPlayer:
         for win in self.layers + [self.backdrop]:
             win.destroy_output()
 
+    # ---- timeline -----------------------------------------------------
+    def _frozen(self):
+        return self.hold_all or (self.hold_videos and self.timeline_video)
+
+    def _update_frozen(self):
+        if self._frozen():
+            if self.next_at is not None:
+                self.left = max(0.0, self.next_at - self.clock.now())
+                self.next_at = None
+                self._cancel_events()
+        elif self.left is not None:
+            self.next_at = self.clock.now() + self.left
+            self.left = None
+            self._arm()
+
+    def _set_timeline(self, begin_at, video):
+        """Next transition at clock time begin_at (None: when the current
+        video ends), timed by a video's playback if video."""
+        self._cancel_events()
+        self.timeline_video = video
+        self.next_at, self.left = begin_at, None
+        if begin_at is None:
+            return
+        self._update_frozen()
+        if self.next_at is not None:
+            self._arm()
+
+    def _arm(self):
+        self._cancel_events()
+        if len(self.items) < 2 or self.next_at is None:
+            return
+        self.ev_prepare = self.clock.at(self.next_at - PRELOAD, self._prepare)
+        self.ev_begin = self.clock.at(self.next_at, self._begin)
+
+    def _cancel_events(self):
+        self.clock.cancel(self.ev_prepare)
+        self.clock.cancel(self.ev_begin)
+        self.ev_prepare = self.ev_begin = None
+
+    def _length(self, item):
+        """Seconds from the start of item's transition in to the start of
+        the next one, or None if unknown (wait for the video's end)."""
+        t = show_time(self.show, item)
+        tt = self._transition_time()
+        if t is None:
+            return None
+        if media.kind(item['path']) == 'video':
+            return max(tt, t - tt)    # fade out during its last seconds
+        return max(tt, t)
+
     # ---- running the show ---------------------------------------------
     def _stop(self):
         self.gen += 1
-        for t in self.timers:
-            t.cancel()
-        self.timers = []
+        self._cancel_events()
+        self.next_at = self.left = None
         if self.anim:
-            GLib.source_remove(self.anim)
-            self.anim = 0
+            self.clock.stop(self.anim)
+            self.anim = None
         self.prepared = None
+        self.loading = False
+        self.want_prepare = False
+        self.begin_at = None
 
     def _reset_layer(self, layer):
         layer.clear()
@@ -188,46 +309,36 @@ class SlideshowPlayer:
         if entry.get('shuffle'):
             random.shuffle(self.order)
         self.pos = 0
-        self.played = 0.0
         for layer in self.layers:
             self._reset_layer(layer)
         self.layers[1 - self.cur].hide()
-        self._load(self.layers[self.cur], self._item(), playing=True)
-        self._schedule()
+        item = self._item()
+        self._load(self.layers[self.cur], item, playing=True)
+        length = self._length(item)
+        now = self.clock.now()
+        if length is None:
+            begin = None
+        elif media.kind(item['path']) == 'video':
+            begin = now + length
+        else:
+            # Snap to the shared grid, leaving time to preload.
+            begin = self.clock.boundary(length, now + min(length / 2,
+                                                          PRELOAD + 0.5))
+        self._set_timeline(begin, media.kind(item['path']) == 'video')
 
     def _item(self, pos=None):
         return self.items[self.order[self.pos if pos is None else pos]]
 
-    def _load(self, layer, item, playing):
+    def _load(self, layer, item, playing, surface=None):
         layer.clear()
-        layer.set_wallpaper(item)
+        layer.set_wallpaper(item, surface=surface)
         view = layer.view
         if isinstance(view, VideoView):
-            view.paused = self.paused or not playing
+            view.paused = self.hold_videos or not playing
             if len(self.items) > 1:
                 gen = self.gen
                 view.max_plays = transform.video_plays(item)
                 view.on_finished = lambda: self._video_finished(gen, layer)
-
-    def _schedule(self):
-        if len(self.items) < 2:
-            return                      # a single item just stays up
-        item = self._item()
-        t = show_time(self.show, item)
-        tt = self._transition_time()
-        if t is None:
-            return                      # wait for the video's end event
-        if media.kind(item['path']) == 'video':
-            # It started playing when its transition began; fade out during
-            # its last seconds.
-            begin = max(0.0, t - tt - self.played)
-        else:
-            begin = t
-        self.timers = [_Timer(max(0.0, begin - PRELOAD), self._prepare),
-                       _Timer(begin, self._begin)]
-        if self.paused:
-            for timer in self.timers:
-                timer.pause()
 
     def _transition_time(self):
         return max(0.0, float(self.show.get('transition_time') or 0.0))
@@ -237,10 +348,8 @@ class SlideshowPlayer:
         if gen != self.gen or layer is not self.layers[self.cur] \
                 or self.anim:
             return
-        for t in self.timers:
-            t.cancel()
-        self.timers = []
-        self._begin()
+        self._cancel_events()
+        self._begin(self.clock.now())
 
     def _next_pos(self):
         nxt = self.pos + 1
@@ -254,9 +363,43 @@ class SlideshowPlayer:
         return nxt
 
     def _prepare(self):
-        if self.prepared is not None or self.static:
+        """Load the next item into the hidden layer. Photos render in a
+        worker thread; _begin waits for them if they are late."""
+        if self.static or self.loading:
+            return
+        if self.anim:
+            self.want_prepare = True      # the layer is still in use
+            return
+        if self.prepared is not None:
             return
         nxt = self._next_pos()
+        item = self._item(nxt)
+        if media.kind(item['path']) == 'video':
+            self._place(nxt, item, None)
+            return
+        self.loading = True
+        gen = self.gen
+        m = self.mon
+
+        def work():
+            try:
+                surf = render_image(item, m['w'], m['h'], m['scale'])
+            except Exception as e:      # never leave the show waiting
+                log(f"slideshow: cannot render {item['path']}: {e}")
+                surf = None
+            GLib.idle_add(done, surf)
+
+        def done(surf):
+            if gen != self.gen or not self.loading:
+                return False
+            self.loading = False
+            self._place(nxt, item, surf)
+            if self.begin_at is not None:
+                self._begin(self.begin_at)
+            return False
+        threading.Thread(target=work, daemon=True).start()
+
+    def _place(self, nxt, item, surface):
         kind = self.show.get('transition') or 'fade'
         if kind == 'random':
             kind = random.choice([k for k in transform.TRANSITIONS
@@ -271,30 +414,45 @@ class SlideshowPlayer:
             layer.set_clip(0, 0, 0, 0)          # fully clipped, opaque
         else:
             layer.set_opacity(0.0)
-        self._load(layer, self._item(nxt), playing=False)
+        self._load(layer, item, playing=False, surface=surface)
         self.prepared = nxt
         self.desktop.stack.schedule()
 
-    def _begin(self):
-        if self.static or self.anim:
+    def _begin(self, at=None):
+        """Start the transition to the prepared item. at: when it was due,
+        which the next one is timed from, so late loads don't drift."""
+        if self.static:
             return
-        if self.prepared is None:
-            self._prepare()
-        inc, out = self.layers[1 - self.cur], self.layers[self.cur]
-        if isinstance(inc.view, VideoView):
-            inc.view.pause(self.paused)
-        duration = self._transition_time()
-        if self.transition == 'none' or duration <= 0:
-            self.played = 0.0
+        at = self.next_at if at is None else at
+        if at is None:
+            at = self.clock.now()
+        if self.anim:                   # previous one still running
+            self.clock.stop(self.anim)
             self._finish()
+        if self.prepared is None:
+            self.begin_at = at
+            self._prepare()
+            if self.prepared is None:
+                return                  # resumed when the photo is ready
+        self.begin_at = None
+        inc, out = self.layers[1 - self.cur], self.layers[self.cur]
+        item = self._item(self.prepared)
+        if isinstance(inc.view, VideoView):
+            inc.view.pause(self.hold_videos)
+        length = self._length(item)
+        self._set_timeline(None if length is None else at + length,
+                           media.kind(item['path']) == 'video')
+        duration = self._transition_time()
+        if self.transition == 'none' or duration <= 0 or self.hold_videos:
+            self._finish()              # covered: nobody sees it, just cut
             return
-        self.played = duration
-        t0 = GLib.get_monotonic_time()
+        now = self.clock.now()
+        t0 = at if now - at < LATE else now
         W, H = self.mon['w'], self.mon['h']
         kind = self.transition
 
-        def step():
-            p = min(1.0, (GLib.get_monotonic_time() - t0) / (duration * 1e6))
+        def step(now):
+            p = min(1.0, max(0.0, (now - t0) / duration))
             e = p * p * (3 - 2 * p)            # smoothstep
             if kind == 'fade':
                 inc.set_opacity(e)
@@ -313,18 +471,20 @@ class SlideshowPlayer:
             elif kind == 'wipe-down':
                 inc.set_clip(0, 0, W, H * e)
             if p >= 1.0:
-                self.anim = 0
+                self.anim = None
                 self._finish()
                 return False
             return True
-        self.anim = GLib.timeout_add(FRAME_MS, step)
+        self.anim = step
+        self.clock.animate(step)
 
     def _finish(self):
+        self.anim = None
         inc, out = self.layers[1 - self.cur], self.layers[self.cur]
         inc.set_opacity(1.0)
         inc.set_clip(None, 0, 0, 0)
         if isinstance(inc.view, VideoView):
-            inc.view.pause(self.paused)
+            inc.view.pause(self.hold_videos)
         self._reset_layer(out)
         out.hide()
         self.cur = 1 - self.cur
@@ -339,4 +499,6 @@ class SlideshowPlayer:
             gen = self.gen
             view.on_finished = lambda: self._video_finished(gen, inc)
         self.desktop.stack.schedule()
-        self._schedule()
+        if self.want_prepare:
+            self.want_prepare = False
+            self._prepare()
