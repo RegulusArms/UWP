@@ -71,7 +71,30 @@ fi
 command -v update-desktop-database >/dev/null && \
     update-desktop-database -q "$HOME/.local/share/applications" 2>/dev/null
 
-# 4. Settings and cache.
+# 4. GNOME Shell helper extension.
+EXT_UUID=uwp-helper@regulusarms.github.io
+EXT_LINK="$HOME/.local/share/gnome-shell/extensions/$EXT_UUID"
+if [ -e "$EXT_LINK" ] || [ -L "$EXT_LINK" ]; then
+    gnome-extensions disable "$EXT_UUID" 2>/dev/null
+    if [ -x /usr/bin/gsettings ]; then
+        /usr/bin/python3 - "$EXT_UUID" <<'PY'
+import subprocess, sys, ast
+uuid = sys.argv[1]
+out = subprocess.check_output(
+    ['/usr/bin/gsettings', 'get', 'org.gnome.shell', 'enabled-extensions'],
+    text=True).strip()
+on = ast.literal_eval(out.removeprefix('@as').strip())
+if uuid in on:
+    subprocess.check_call(['/usr/bin/gsettings', 'set', 'org.gnome.shell',
+                           'enabled-extensions',
+                           str([u for u in on if u != uuid])])
+PY
+    fi
+    rm -rf "$EXT_LINK"
+    echo "Removed the UWP helper GNOME extension."
+fi
+
+# 5. Settings and cache.
 if [ "$PURGE" = 1 ]; then
     rm -rf "$CONFIG/uwp" "$CACHE/uwp"
     echo "Deleted settings ($CONFIG/uwp) and cache ($CACHE/uwp)."

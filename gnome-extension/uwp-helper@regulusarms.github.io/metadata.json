@@ -1,0 +1,7 @@
+{
+    "uuid": "uwp-helper@regulusarms.github.io",
+    "name": "UWP Wallpapers helper",
+    "description": "Keeps UWP's wallpaper windows underneath the desktop icons on Wayland, and tells UWP which monitors are covered by maximized or fullscreen windows so it can pause videos there.",
+    "shell-version": ["46", "47", "48", "49", "50"],
+    "url": "https://github.com/RegulusArms/UWP"
+}

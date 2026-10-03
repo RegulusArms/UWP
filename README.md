@@ -55,6 +55,13 @@ This adds a `uwp` command (`~/.local/bin/uwp`), a "UWP Wallpapers" entry in
 the app grid, and starts UWP in the top bar. To start it at login, turn on
 **Start UWP when I log in** under *Shortcuts & settings*.
 
+It also installs and enables the **UWP Wallpapers helper** GNOME Shell
+extension (`gnome-extension/`). On Wayland it keeps the wallpaper under the
+desktop icons and lets UWP see which monitors are covered. GNOME on Wayland
+only loads a new extension at login, so **log out and back in once** after
+the first install. Until then UWP re-lowers its windows a few times a
+second, so icons and their menus may blink briefly when clicked.
+
 ```sh
 ./reinstall.sh            # reinstall, keeping settings (--clean to start fresh)
 ./uninstall.sh            # remove, keeping settings (--purge to delete them too)
@@ -112,6 +119,7 @@ Nothing personal is written into this folder:
 | Thumbnails, log | `~/.cache/uwp/` |
 | Keyboard shortcuts | GNOME custom shortcuts (Settings → Keyboard) |
 | Start at login | `~/.config/autostart/io.github.RegulusArms.UWP.desktop` |
+| GNOME Shell helper | `~/.local/share/gnome-shell/extensions/uwp-helper@regulusarms.github.io` (link to `gnome-extension/`) |
 
 ## How it works
 
@@ -119,6 +127,10 @@ Nothing personal is written into this folder:
   windows. Under Wayland these are XWayland windows: UWP forces GTK and
   GStreamer onto X11 and hides `WAYLAND_DISPLAY` from its own process (apps it
   opens get it back).
+- Desktop Icons NG lowers its windows to the bottom whenever they're
+  clicked. On X11 UWP sees that through libwnck and lowers itself again. On
+  Wayland the icon windows are invisible to UWP, so the helper extension
+  does it from inside GNOME Shell before the next frame is drawn.
 - Images are drawn once with Cairo.
 - Videos play through GStreamer: hardware decoding, then `gltransformation`
   for scale and rotation on the GPU, then `glimagesink`. Looping uses
@@ -133,9 +145,11 @@ total.
 
 - Built and tested on GNOME (X11 and Wayland). Other desktops may work but
   are untested.
-- On Wayland, "pause videos hidden behind maximized or fullscreen windows"
-  only notices X11 (XWayland) apps: GNOME doesn't list native Wayland
-  windows to other apps.
+- On Wayland, keeping desktop icons clickable and "pause videos hidden
+  behind maximized or fullscreen windows" need the helper extension (see
+  [Install](#install)). Without it, icons may blink when clicked, and pausing
+  only notices X11 (XWayland) apps, because GNOME doesn't list native
+  Wayland windows to other apps.
 - Profiles remember monitors by connector name (`DP-1`, `HDMI-1`...). Xorg
   and Wayland can name the same port differently (NVIDIA's Xorg driver
   counts `DP-0`, `DP-2`...), so on GNOME UWP also records each monitor's

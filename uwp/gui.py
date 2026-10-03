@@ -413,10 +413,11 @@ class SettingsDialog(Gtk.Dialog):
         pause = Gtk.CheckButton(
             label='Pause videos hidden behind maximized or fullscreen windows')
         pause.set_active(edit.get('pause_when_covered', True))
-        if renderer.on_wayland():
+        if renderer.on_wayland() and renderer.helper_covered([]) is None:
             pause.set_tooltip_text(
-                'On Wayland this only notices X11 (XWayland) apps; GNOME '
-                'does not show native Wayland windows to other apps.')
+                'On Wayland this needs the UWP helper GNOME extension '
+                '(run install.sh, then log out and back in); until then it '
+                'only notices X11 (XWayland) apps.')
         pause.connect('toggled', lambda b: edit.__setitem__(
             'pause_when_covered', b.get_active()))
         grid.attach(pause, 0, row, 2, 1)

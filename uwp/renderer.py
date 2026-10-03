@@ -578,6 +578,32 @@ def on_wayland():
                 os.environ.get('XDG_SESSION_TYPE') == 'wayland')
 
 
+HELPER_UUID = 'uwp-helper@regulusarms.github.io'   # gnome-extension/
+_HELPER = ('org.gnome.Shell', '/io/github/RegulusArms/UWP/Helper',
+           'io.github.RegulusArms.UWP.Helper')
+_helper_seen = None
+
+
+def helper_covered(keys):
+    """Monitors (of keys) covered by maximized/fullscreen windows, as seen
+    by the UWP GNOME Shell helper extension, or None if it isn't running.
+    Unlike libwnck it sees native Wayland windows too."""
+    global _helper_seen
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        out = bus.call_sync(
+            _HELPER[0], _HELPER[1], _HELPER[2], 'GetCovered',
+            GLib.Variant('(as)', (list(keys),)), GLib.VariantType('(as)'),
+            Gio.DBusCallFlags.NONE, 500, None).unpack()[0]
+    except GLib.Error:
+        out = None
+    if (out is not None) != _helper_seen:
+        _helper_seen = out is not None
+        log(f'GNOME Shell helper extension {HELPER_UUID}: '
+            + ('active' if _helper_seen else 'not running'))
+    return set(out) if out is not None else None
+
+
 _wnck = None
 
 
@@ -602,6 +628,8 @@ class StackKeeper:
     receives the clicks. DING lowers its own transparent windows whenever
     they are raised, which would otherwise slip them under ours."""
 
+    POLL_MS = 200   # Wayland without the helper extension
+
     def __init__(self, desktop):
         self.desktop = desktop
         self._pending = 0
@@ -609,6 +637,26 @@ class StackKeeper:
         if self.screen is not None:
             self.screen.connect('window-stacking-changed',
                                 lambda _s: self.schedule())
+        if on_wayland():
+            # DING's windows are Wayland ones there: libwnck can't see them
+            # restack, so nothing tells us when they slip under ours. The
+            # helper extension fixes that inside GNOME Shell; until it runs,
+            # keep lowering ours (one tiny X message, no repaint if already
+            # at the bottom). Checked for the helper every 5 s.
+            self._helper = False
+            self._helper_check = 0
+            GLib.timeout_add(self.POLL_MS, self._poll)
+
+    def _poll(self):
+        self._helper_check -= self.POLL_MS
+        if self._helper_check <= 0:
+            self._helper_check = 5000
+            self._helper = helper_covered([]) is not None
+        if not self._helper:
+            ours = self._ours()
+            if ours:
+                xstack.lower(ours)
+        return True
 
     def schedule(self):
         if not self._pending:
@@ -657,23 +705,24 @@ class StackKeeper:
 class CoverWatcher:
     """Reports which monitors are hidden behind a fullscreen/maximized (or
     near-full-size) window on the current workspace, so their videos can be
-    paused. Uses libwnck, which only sees X11 windows: under Wayland that
-    means XWayland apps only (GNOME won't list native Wayland windows to
-    other apps). Silently disabled if libwnck is unavailable."""
+    paused. On X11 this uses libwnck. GNOME won't list native Wayland
+    windows to other apps, so under Wayland it asks the UWP helper
+    extension, falling back to libwnck (X11/XWayland apps only)."""
 
     def __init__(self, callback):
         self.callback = callback
         self.enabled = False
         self.last = None
         self.Wnck, self.screen = wnck_screen()
-        if self.screen is not None:
+        self.wayland = on_wayland()
+        if self.screen is not None or self.wayland:
             GLib.timeout_add(1000, self._tick)
-            if on_wayland():
-                log('Wayland session: pause-when-covered only sees X11 '
-                    '(XWayland) windows')
+
+    def available(self):
+        return self.screen is not None or self.wayland
 
     def set_enabled(self, enabled):
-        self.enabled = enabled and self.screen is not None
+        self.enabled = enabled and self.available()
         self.last = None
         if not self.enabled:
             self.callback(set())
@@ -687,6 +736,17 @@ class CoverWatcher:
         return True
 
     def _compute(self):
+        if self.wayland:
+            # Only the helper extension sees native Wayland windows; without
+            # it libwnck still catches X11 (XWayland) apps.
+            covered = helper_covered([m['key'] for m in monitors()])
+            if covered is not None:
+                return covered
+            if self.screen is None:
+                return set()
+        return self._compute_wnck()
+
+    def _compute_wnck(self):
         Wnck = self.Wnck
         ws = self.screen.get_active_workspace()
         wins = []

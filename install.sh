@@ -33,6 +33,44 @@ Categories=Utility;GTK;
 StartupNotify=false
 DESKTOP
 
+# GNOME Shell helper extension: keeps the wallpaper under the desktop icons
+# on Wayland and lets UWP see which monitors are covered there.
+EXT_UUID=uwp-helper@regulusarms.github.io
+EXT_NOTE=""
+if command -v gnome-shell >/dev/null && [ -x /usr/bin/gsettings ]; then
+    EXT_DIR="$HOME/.local/share/gnome-shell/extensions"
+    mkdir -p "$EXT_DIR"
+    ln -sfn "$HERE/gnome-extension/$EXT_UUID" "$EXT_DIR/$EXT_UUID"
+    if ! gnome-extensions info "$EXT_UUID" 2>/dev/null | grep -q 'State: ACTIVE'
+    then
+        # gsettings, not "gnome-extensions enable": the Shell doesn't know a
+        # new extension until it restarts, i.e. the next login on Wayland.
+        /usr/bin/python3 - "$EXT_UUID" <<'PY'
+import subprocess, sys, ast
+uuid = sys.argv[1]
+def get(key):
+    out = subprocess.check_output(['/usr/bin/gsettings', 'get', 'org.gnome.shell', key],
+                                  text=True).strip()
+    return ast.literal_eval(out.removeprefix('@as').strip())
+def put(key, val):
+    subprocess.check_call(['/usr/bin/gsettings', 'set', 'org.gnome.shell', key, str(val)])
+on = get('enabled-extensions')
+if uuid not in on:
+    put('enabled-extensions', on + [uuid])
+off = get('disabled-extensions')
+if uuid in off:
+    put('disabled-extensions', [u for u in off if u != uuid])
+PY
+        gnome-extensions enable "$EXT_UUID" 2>/dev/null || true
+        gnome-extensions info "$EXT_UUID" 2>/dev/null | grep -q 'State: ACTIVE' \
+            || EXT_NOTE=yes
+    fi
+fi
+
 "$HERE/bin/uwp" --background >/dev/null 2>&1 &
 echo "Installed. UWP is now in your top bar; also in the app grid as 'UWP Wallpapers'."
+if [ -n "$EXT_NOTE" ]; then
+    echo "Log out and back in once to start the UWP helper GNOME extension"
+    echo "(needed on Wayland to keep desktop icons above the wallpaper)."
+fi
 echo "Turn on 'Start UWP when I log in' in Shortcuts & settings to autostart it."
