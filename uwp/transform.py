@@ -113,3 +113,44 @@ def gst_params(wp, sw, sh, W, H):
         'translation-y': wp.get('offset_y', 0.0),
         'rotation-z': rot,
     }
+
+
+# ---- slideshows ---------------------------------------------------------
+# A monitor entry is either a single wallpaper (above) or:
+#   {'type': 'slideshow', 'items': [wallpaper, ...],
+#    'transition': one of TRANSITIONS, 'transition_time': seconds,
+#    'photo_duration': seconds, 'shuffle': bool}
+# Items are ordinary wallpaper dicts plus, optionally,
+#   'duration'  photos: seconds on screen (0 = slideshow's photo_duration)
+#   'plays'     videos: times to play the (loop section of the) video
+
+TRANSITIONS = ('fade', 'black', 'wipe-left', 'wipe-right', 'wipe-up',
+               'wipe-down', 'none', 'random')
+TRANSITION_LABELS = {
+    'fade': 'Crossfade',
+    'black': 'Fade through black',
+    'wipe-left': 'Wipe left',
+    'wipe-right': 'Wipe right',
+    'wipe-up': 'Wipe up',
+    'wipe-down': 'Wipe down',
+    'none': 'Cut (no transition)',
+    'random': 'Random',
+}
+
+
+def is_slideshow(entry):
+    return bool(entry) and entry.get('type') == 'slideshow'
+
+
+def new_slideshow(items=()):
+    return {'type': 'slideshow', 'items': list(items), 'transition': 'fade',
+            'transition_time': 1.0, 'photo_duration': 10.0,
+            'shuffle': False}
+
+
+def photo_duration(show, item):
+    return float(item.get('duration') or show.get('photo_duration') or 10.0)
+
+
+def video_plays(item):
+    return max(1, int(item.get('plays') or 1))

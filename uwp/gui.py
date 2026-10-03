@@ -71,7 +71,7 @@ class MonitorLayout(Gtk.DrawingArea):
             cr.clip()
             cr.set_source_rgb(0.08, 0.08, 0.09)
             cr.paint()
-            wp = profile['monitors'].get(key)
+            wp = self.gui.shown_wp(key)
             if wp:
                 t = self.gui.thumb(wp['path'])
                 if t:
@@ -79,7 +79,8 @@ class MonitorLayout(Gtk.DrawingArea):
                     transform.cairo_paint(cr, t[0], wp, w, h, t[1], t[2],
                                           px_scale=w / m['w'])
             cr.restore()
-            self._label(cr, x, y, w, h, key, wp)
+            self._label(cr, x, y, w, h, key, profile['monitors'].get(key),
+                        wp)
             sel = key in self.gui.selected
             cr.set_line_width(4 if sel else 1)
             if sel:
@@ -91,9 +92,12 @@ class MonitorLayout(Gtk.DrawingArea):
         return True
 
     @staticmethod
-    def _label(cr, x, y, w, h, key, wp):
+    def _label(cr, x, y, w, h, key, entry, wp):
         text = key
-        if wp is None:
+        if transform.is_slideshow(entry):
+            n = len(entry.get('items', []))
+            text += f'  (slideshow, {n} item{"" if n == 1 else "s"})'
+        elif wp is None:
             text += '  (no wallpaper)'
         elif media.kind(wp['path']) == 'video':
             speed, start, end = transform.playback(wp)
@@ -131,12 +135,11 @@ class MonitorLayout(Gtk.DrawingArea):
         else:
             if key not in self.gui.selected:
                 self.gui.set_selected({key})
-            wp = self.gui.profile()['monitors'].get(key)
-            if wp:
+            if self.gui.edit_wp(key):
                 self.drag = (key, ev.x, ev.y,
-                             {k: dict(self.gui.profile()['monitors'][k])
+                             {k: dict(self.gui.edit_wp(k))
                               for k in self.gui.selected
-                              if k in self.gui.profile()['monitors']})
+                              if self.gui.edit_wp(k)})
         return True
 
     def _release(self, _w, _ev):
@@ -148,7 +151,7 @@ class MonitorLayout(Gtk.DrawingArea):
         win = self.get_window()
         if win:
             cursor = None
-            if self.drag or (key and self.gui.profile()['monitors'].get(key)):
+            if self.drag or (key and self.gui.edit_wp(key)):
                 cursor = Gdk.Cursor.new_from_name(
                     win.get_display(), 'grabbing' if self.drag else 'grab')
             win.set_cursor(cursor)
@@ -157,18 +160,18 @@ class MonitorLayout(Gtk.DrawingArea):
         dkey, sx, sy, start = self.drag
         _, _, w, h = self.rects[dkey]
         dx, dy = (ev.x - sx) / w, (ev.y - sy) / h
-        mons = self.gui.profile()['monitors']
         for k, orig in start.items():
-            mons[k]['offset_x'] = round(orig['offset_x'] + dx, 4)
-            mons[k]['offset_y'] = round(orig['offset_y'] + dy, 4)
+            wp = self.gui.edit_wp(k)
+            if wp:
+                wp['offset_x'] = round(orig['offset_x'] + dx, 4)
+                wp['offset_y'] = round(orig['offset_y'] + dy, 4)
         self.gui.sync_controls()
         self.gui.changed()
         return True
 
     def _scroll(self, _w, ev):
         key = self._hit(ev.x, ev.y)
-        mons = self.gui.profile()['monitors']
-        if key is None or key not in mons:
+        if key is None or not self.gui.edit_wp(key):
             return False
         if key not in self.gui.selected:
             self.gui.set_selected({key})
@@ -179,7 +182,7 @@ class MonitorLayout(Gtk.DrawingArea):
         if not dy:
             return True
         for k in self.gui.selected:
-            wp = mons.get(k)
+            wp = self.gui.edit_wp(k)
             if not wp:
                 continue
             if ev.state & Gdk.ModifierType.SHIFT_MASK:
@@ -410,6 +413,11 @@ class SettingsDialog(Gtk.Dialog):
         pause = Gtk.CheckButton(
             label='Pause videos hidden behind maximized or fullscreen windows')
         pause.set_active(edit.get('pause_when_covered', True))
+        if renderer.on_wayland() and renderer.helper_covered([]) is None:
+            pause.set_tooltip_text(
+                'On Wayland this needs the UWP helper GNOME extension '
+                '(run install.sh, then log out and back in); until then it '
+                'only notices X11 (XWayland) apps.')
         pause.connect('toggled', lambda b: edit.__setitem__(
             'pause_when_covered', b.get_active()))
         grid.attach(pause, 0, row, 2, 1)
@@ -488,6 +496,8 @@ class WallpaperGui(Gtk.ApplicationWindow):
         self._profile_combo_busy = False
         self._live_pending = 0
         self._committed = False
+        self.ss_item = None          # selected item in the slideshow list
+        self._ss_busy = False
 
         prov = Gtk.CssProvider()
         prov.load_from_data(CSS)
@@ -505,22 +515,51 @@ class WallpaperGui(Gtk.ApplicationWindow):
         self.add(root)
 
         root.add(self._build_profile_bar())
+
+        # Editor on top, library below, split by a draggable divider.
+        self.split = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+        self.split.set_wide_handle(True)
+        root.pack_start(self.split, True, True, 0)
+        upper = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        upper.set_margin_bottom(6)
+        lower = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        lower.set_margin_top(6)
+        # The editor sits in a scroller with no scrollbar so the divider can
+        # be dragged all the way up: the editor is clipped, not squashed.
+        self.upper_sw = Gtk.ScrolledWindow()
+        self.upper_sw.set_policy(Gtk.PolicyType.NEVER,
+                                 Gtk.PolicyType.EXTERNAL)
+        self.upper_sw.set_propagate_natural_height(True)
+        self.upper_sw.set_shadow_type(Gtk.ShadowType.NONE)
+        self.upper_sw.add(upper)
+        self.split.pack1(self.upper_sw, True, True)
+        self.split.pack2(lower, True, False)
+        # Any click in the editor snaps it back to full height. Capture
+        # phase + unclaimed, so the click still reaches the slider/button.
+        self._snap_gesture = Gtk.GestureMultiPress.new(self.upper_sw)
+        self._snap_gesture.set_button(0)
+        self._snap_gesture.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        self._snap_gesture.connect('pressed',
+                                   lambda *_: self.snap_editor_open())
+        self._snap_anim = 0
+
         top = Gtk.Box(spacing=12)
         frame = Gtk.Frame()
         self.layout = MonitorLayout(self)
         frame.add(self.layout)
         top.pack_start(frame, True, True, 0)
         top.pack_start(self._build_controls(), False, False, 0)
-        root.add(top)
+        upper.pack_start(top, True, True, 0)
         hint = Gtk.Label(xalign=0, label=(
             'Click a monitor (Ctrl+click for several), then click a wallpaper '
             'below. In the preview: drag to move, scroll to zoom, '
-            'Shift+scroll to rotate.'))
+            'Shift+scroll to rotate. Drag the divider below to resize the '
+            'library.'))
         hint.get_style_context().add_class('dim-label')
-        root.add(hint)
-        root.add(Gtk.Separator())
-        root.add(self._build_library_bar())
+        upper.add(hint)
+        lower.add(self._build_library_bar())
         sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.set_size_request(-1, 120)
         sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.flow = Gtk.FlowBox(homogeneous=True, valign=Gtk.Align.START,
                                 activate_on_single_click=True,
@@ -529,13 +568,40 @@ class WallpaperGui(Gtk.ApplicationWindow):
         self.flow.set_filter_func(self._filter)
         self.flow.connect('child-activated', self._on_item_activated)
         sw.add(self.flow)
-        root.pack_start(sw, True, True, 0)
+        lower.pack_start(sw, True, True, 0)
         root.add(self._build_bottom_bar())
 
         self.reload_library()
         self.refresh_profiles()
         self.sync_controls()
         self.show_all()
+        pos = self.app.cfg.get('gui', {}).get('split')
+        if pos:
+            self.split.set_position(pos)
+
+    # ---- editor/library divider ----------------------------------------
+    def editor_height(self):
+        """Paned position at which the editor is fully visible."""
+        return self.upper_sw.get_preferred_height()[1]
+
+    def snap_editor_open(self):
+        target = self.editor_height()
+        start = self.split.get_position()
+        if start >= target - 2 or self._snap_anim:
+            return
+        self.upper_sw.get_vadjustment().set_value(0)
+        t0 = GLib.get_monotonic_time()
+        duration = 160_000       # microseconds
+
+        def step():
+            k = min(1.0, (GLib.get_monotonic_time() - t0) / duration)
+            ease = 1 - (1 - k) ** 3
+            self.split.set_position(int(start + (target - start) * ease))
+            if k >= 1.0:
+                self._snap_anim = 0
+                return False
+            return True
+        self._snap_anim = GLib.timeout_add(16, step)
 
     # ---- helpers -------------------------------------------------------
     def profile(self):
@@ -554,14 +620,22 @@ class WallpaperGui(Gtk.ApplicationWindow):
             # Coalesce bursts (slider drags) to ~30 desktop updates/second.
             self._live_pending = GLib.timeout_add(33, self._push_live)
 
+    def _preview_profile(self):
+        p = self.profile()
+        key = self.ss_key()
+        if key and self.ss_item is not None:
+            p = config.clone(p)
+            p['monitors'][key]['_preview_item'] = self.ss_item
+        return p
+
     def _push_live(self):
         self._live_pending = 0
-        self.app.preview(self.profile())
+        self.app.preview(self._preview_profile())
         return False
 
     def _on_live(self, btn):
         if btn.get_active():
-            self.app.preview(self.profile())
+            self.app.preview(self._preview_profile())
             self._status('Live preview on: the desktop follows your edits. '
                          'OK keeps them, Cancel restores.')
         else:
@@ -570,11 +644,53 @@ class WallpaperGui(Gtk.ApplicationWindow):
                 self._live_pending = 0
             self.app.end_preview()
 
+    def ss_key(self):
+        """The monitor whose slideshow is being edited: exactly one
+        monitor selected and it holds a slideshow."""
+        if len(self.selected) == 1:
+            key = next(iter(self.selected))
+            if transform.is_slideshow(self.profile()['monitors'].get(key)):
+                return key
+        return None
+
+    def ss_entry(self):
+        key = self.ss_key()
+        return self.profile()['monitors'][key] if key else None
+
+    def edit_wp(self, key):
+        """The wallpaper dict the controls edit for this monitor: the entry
+        itself, or the selected slideshow item (None if nothing)."""
+        entry = self.profile()['monitors'].get(key)
+        if not transform.is_slideshow(entry):
+            return entry
+        items = entry.get('items', [])
+        if key == self.ss_key() and self.ss_item is not None \
+                and self.ss_item < len(items):
+            return items[self.ss_item]
+        return None
+
+    def shown_wp(self, key):
+        """What the layout preview draws for this monitor."""
+        entry = self.profile()['monitors'].get(key)
+        if not transform.is_slideshow(entry):
+            return entry
+        return self.edit_wp(key) or (entry.get('items') or [None])[0]
+
+    def all_paths(self):
+        for entry in self.profile()['monitors'].values():
+            if transform.is_slideshow(entry):
+                for item in entry.get('items', []):
+                    yield item['path']
+            elif entry:
+                yield entry['path']
+
     def selected_wps(self):
-        mons = self.profile()['monitors']
-        return [mons[k] for k in sorted(self.selected) if k in mons]
+        return [w for w in (self.edit_wp(k) for k in sorted(self.selected))
+                if w]
 
     def set_selected(self, keys):
+        if set(keys) != self.selected:
+            self.ss_item = None
         self.selected = set(keys)
         self.sync_controls()
         self.layout.queue_draw()
@@ -692,6 +808,18 @@ class WallpaperGui(Gtk.ApplicationWindow):
         self.wp_label.get_style_context().add_class('dim-label')
         panel.add(self.wp_label)
 
+        switch = Gtk.Box(spacing=0)
+        switch.get_style_context().add_class('linked')
+        self.type_single = Gtk.RadioButton.new_with_label(None, 'Single')
+        self.type_show = Gtk.RadioButton.new_with_label_from_widget(
+            self.type_single, 'Slideshow')
+        for b in (self.type_single, self.type_show):
+            b.set_mode(False)                   # draw as toggle buttons
+            b.connect('toggled', self._on_type)
+            switch.pack_start(b, True, True, 0)
+        self.type_switch = switch
+        panel.add(switch)
+
         notebook = Gtk.Notebook()
         panel.add(notebook)
         place = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -699,6 +827,8 @@ class WallpaperGui(Gtk.ApplicationWindow):
         notebook.append_page(place, Gtk.Label(label='Placement'))
         notebook.append_page(self._build_video_page(),
                              Gtk.Label(label='Video'))
+        notebook.append_page(self._build_slideshow_page(),
+                             Gtk.Label(label='Slideshow'))
         self.notebook = notebook
 
         grid = Gtk.Grid(column_spacing=8, row_spacing=6)
@@ -741,7 +871,7 @@ class WallpaperGui(Gtk.ApplicationWindow):
         btns = Gtk.Box(spacing=4)
         for label, cb in (('Reset', self._reset_transform),
                           ('Copy to all', self._copy_to_all),
-                          ('Remove', self._clear_wallpaper)):
+                          ('Clear monitor', self._clear_wallpaper)):
             b = Gtk.Button(label=label)
             b.connect('clicked', cb)
             btns.pack_start(b, True, True, 0)
@@ -929,6 +1059,312 @@ class WallpaperGui(Gtk.ApplicationWindow):
     def _on_full_video(self, _b):
         self._set_playback(loop_start=0.0, loop_end=0.0)
 
+    # ---- slideshow ------------------------------------------------------
+    def _build_slideshow_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        page.set_border_width(8)
+        self.ss_hint = Gtk.Label(xalign=0, wrap=True)
+        self.ss_hint.set_no_show_all(True)
+        self.ss_hint.get_style_context().add_class('dim-label')
+        page.add(self.ss_hint)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.ss_box = box
+        page.add(box)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.set_min_content_height(132)
+        sw.set_shadow_type(Gtk.ShadowType.IN)
+        self.ss_list = Gtk.ListBox()
+        self.ss_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.ss_list.connect('row-selected', self._on_ss_row)
+        sw.add(self.ss_list)
+        box.add(sw)
+        self.ss_rows = []
+
+        btns = Gtk.Box(spacing=4)
+        for icon, tip, cb in (
+                ('go-up-symbolic', 'Move up', lambda _b: self._ss_move(-1)),
+                ('go-down-symbolic', 'Move down',
+                 lambda _b: self._ss_move(1)),
+                ('list-remove-symbolic', 'Remove from slideshow',
+                 lambda _b: self._ss_remove())):
+            b = Gtk.Button.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
+            b.set_tooltip_text(tip)
+            b.connect('clicked', cb)
+            btns.add(b)
+        play = Gtk.Button(label='\u25b6 Play slideshow')
+        play.set_tooltip_text('Deselect the item so the live preview runs '
+                              'the whole slideshow with its transitions')
+        play.connect('clicked', lambda _b: self._ss_list_select(None))
+        btns.pack_end(play, False, False, 0)
+        box.add(btns)
+
+        # per-item timing
+        self.ss_item_row = Gtk.Box(spacing=6)
+        self.ss_item_label = Gtk.Label(xalign=0)
+        self.ss_item_adj = Gtk.Adjustment(value=0, lower=0, upper=3600,
+                                          step_increment=1, page_increment=10)
+        self.ss_item_adj.connect('value-changed', self._on_ss_item_time)
+        self.ss_item_spin = Gtk.SpinButton(adjustment=self.ss_item_adj,
+                                           digits=1, width_chars=6)
+        self.ss_item_unit = Gtk.Label(xalign=0)
+        self.ss_item_unit.get_style_context().add_class('dim-label')
+        self.ss_item_row.add(self.ss_item_label)
+        self.ss_item_row.add(self.ss_item_spin)
+        self.ss_item_row.add(self.ss_item_unit)
+        box.add(self.ss_item_row)
+
+        box.add(Gtk.Separator())
+        grid = Gtk.Grid(column_spacing=8, row_spacing=6)
+        self.ss_trans = Gtk.ComboBoxText()
+        for t in transform.TRANSITIONS:
+            self.ss_trans.append(t, transform.TRANSITION_LABELS[t])
+        self.ss_trans.connect('changed', self._on_ss_setting)
+        grid.attach(Gtk.Label(label='Transition', xalign=0), 0, 0, 1, 1)
+        grid.attach(self.ss_trans, 1, 0, 2, 1)
+        self.ss_adj = {}
+        for row, (key, label, lo, hi, step) in enumerate((
+                ('transition_time', 'Transition length (s)', 0, 10, 0.1),
+                ('photo_duration', 'Photo duration (s)', 0.5, 3600, 1)), 1):
+            adj = Gtk.Adjustment(value=lo, lower=lo, upper=hi,
+                                 step_increment=step, page_increment=step * 10)
+            adj.connect('value-changed', self._on_ss_setting)
+            self.ss_adj[key] = adj
+            grid.attach(Gtk.Label(label=label, xalign=0, hexpand=True),
+                        0, row, 1, 1)
+            grid.attach(Gtk.SpinButton(adjustment=adj, digits=1,
+                                       width_chars=6), 1, row, 2, 1)
+        self.ss_shuffle = Gtk.CheckButton(label='Shuffle order')
+        self.ss_shuffle.connect('toggled', self._on_ss_setting)
+        grid.attach(self.ss_shuffle, 0, 3, 3, 1)
+        box.add(grid)
+        tip = Gtk.Label(xalign=0, wrap=True, max_width_chars=40, label=(
+            'Click library items to add them. Select an item to adjust its '
+            'placement and loop on the other tabs. Videos play their full '
+            'length (or loop section), photos use their duration.'))
+        tip.get_style_context().add_class('dim-label')
+        box.add(tip)
+        return page
+
+    def _on_type(self, btn):
+        if self._syncing or not btn.get_active():
+            return
+        mons = self.profile()['monitors']
+        to_show = btn is self.type_show
+        for k in self.selected:
+            entry = mons.get(k)
+            if to_show and not transform.is_slideshow(entry):
+                mons[k] = transform.new_slideshow([entry] if entry else [])
+            elif not to_show and transform.is_slideshow(entry):
+                items = entry.get('items', [])
+                pick = self.ss_item if (self.ss_item is not None and
+                                        self.ss_item < len(items)) else 0
+                if items:
+                    mons[k] = items[pick]
+                else:
+                    mons.pop(k)
+        self.ss_item = 0 if (to_show and self.ss_entry() and
+                             self.ss_entry()['items']) else None
+        if to_show:
+            self.notebook.set_current_page(2)
+        self.sync_controls()
+        self.changed()
+
+    def _ss_describe(self, show, item):
+        if media.kind(item['path']) == 'video':
+            n = transform.video_plays(item)
+            speed, start, end = transform.playback(item)
+            bits = ['video', 'plays once' if n == 1 else f'plays {n}\u00d7']
+            if speed != 1:
+                bits.append(f'{speed:g}\u00d7 speed')
+            if start or end:
+                bits.append('loop section')
+            return ' \u00b7 '.join(bits)
+        own = item.get('duration')
+        secs = transform.photo_duration(show, item)
+        return f'photo \u00b7 {secs:g} s' + ('' if own else ' (default)')
+
+    def _ss_rebuild(self):
+        """Rebuild the item list for the edited slideshow (only when its
+        contents changed; otherwise just sync selection and details)."""
+        show = self.ss_entry()
+        sig = (self.ss_key(), tuple(i['path'] for i in show['items'])
+               if show else ())
+        if sig == getattr(self, '_ss_sig', None):
+            self._ss_busy = True
+            if self.ss_item is not None and self.ss_item < len(self.ss_rows):
+                self.ss_list.select_row(self.ss_rows[self.ss_item])
+            else:
+                self.ss_list.unselect_all()
+            self._ss_busy = False
+            self._ss_refresh_details()
+            return
+        self._ss_sig = sig
+        self._ss_busy = True
+        for row in self.ss_list.get_children():
+            self.ss_list.remove(row)
+        self.ss_rows = []
+        show = self.ss_entry()
+        for i, item in enumerate(show.get('items', []) if show else []):
+            row = Gtk.ListBoxRow()
+            hb = Gtk.Box(spacing=8)
+            hb.set_border_width(3)
+            img = Gtk.Image.new_from_icon_name(
+                'video-x-generic' if media.kind(item['path']) == 'video'
+                else 'image-x-generic', Gtk.IconSize.DND)
+            img.set_size_request(64, 40)
+            hb.add(img)
+            vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            vb.add(Gtk.Label(label=f'{i + 1}. {os.path.basename(item["path"])}',
+                             xalign=0, ellipsize=Pango.EllipsizeMode.MIDDLE))
+            detail = Gtk.Label(label=self._ss_describe(show, item), xalign=0)
+            detail.get_style_context().add_class('dim-label')
+            vb.add(detail)
+            hb.pack_start(vb, True, True, 0)
+            row.add(hb)
+            row.path, row.img, row.detail = item['path'], img, detail
+            self.ss_list.add(row)
+            self.ss_rows.append(row)
+            t = self.thumbs.get(item['path'])
+            if t:
+                self._ss_set_img(row, t[0])
+            else:
+                self.thumbs.request(item['path'], self._on_thumb)
+        self.ss_list.show_all()
+        if self.ss_item is not None and self.ss_item < len(self.ss_rows):
+            self.ss_list.select_row(self.ss_rows[self.ss_item])
+        else:
+            self.ss_list.unselect_all()
+        self._ss_busy = False
+
+    @staticmethod
+    def _ss_set_img(row, pixbuf):
+        pw, ph = pixbuf.get_width(), pixbuf.get_height()
+        k = min(64 / pw, 40 / ph)
+        row.img.set_from_pixbuf(pixbuf.scale_simple(
+            max(1, int(pw * k)), max(1, int(ph * k)), 2))
+
+    def _ss_thumb(self, path, result):
+        if result:
+            for row in self.ss_rows:
+                if row.path == path:
+                    self._ss_set_img(row, result[0])
+
+    def _ss_list_select(self, index):
+        self.ss_item = index
+        self.sync_controls()
+        self.changed()
+
+    def _on_ss_row(self, _lb, row):
+        if self._ss_busy:
+            return
+        index = self.ss_rows.index(row) if row in self.ss_rows else None
+        if index != self.ss_item:
+            self._ss_list_select(index)
+
+    def _ss_move(self, delta):
+        show = self.ss_entry()
+        i = self.ss_item
+        if not show or i is None:
+            return
+        j = i + delta
+        items = show['items']
+        if 0 <= j < len(items):
+            items[i], items[j] = items[j], items[i]
+            self.ss_item = j
+            self.sync_controls()
+            self.changed()
+
+    def _ss_remove(self):
+        show = self.ss_entry()
+        i = self.ss_item
+        if not show or i is None or i >= len(show['items']):
+            return
+        del show['items'][i]
+        n = len(show['items'])
+        self.ss_item = min(i, n - 1) if n else None
+        self.sync_controls()
+        self.changed()
+
+    def _on_ss_item_time(self, adj):
+        if self._syncing:
+            return
+        wp = self.edit_wp(self.ss_key()) if self.ss_key() else None
+        if not wp:
+            return
+        if media.kind(wp['path']) == 'video':
+            wp['plays'] = max(1, int(round(adj.get_value())))
+        else:
+            wp['duration'] = round(adj.get_value(), 2)   # 0 = default
+        self._ss_refresh_details()
+        self.changed()
+
+    def _on_ss_setting(self, *_):
+        show = self.ss_entry()
+        if self._syncing or not show:
+            return
+        show['transition'] = self.ss_trans.get_active_id() or 'fade'
+        show['transition_time'] = round(
+            self.ss_adj['transition_time'].get_value(), 2)
+        show['photo_duration'] = round(
+            self.ss_adj['photo_duration'].get_value(), 2)
+        show['shuffle'] = self.ss_shuffle.get_active()
+        self._ss_refresh_details()
+        self.changed()
+
+    def _ss_refresh_details(self):
+        show = self.ss_entry()
+        if show:
+            for row, item in zip(self.ss_rows, show['items']):
+                row.detail.set_text(self._ss_describe(show, item))
+
+    def sync_slideshow(self):
+        mons = self.profile()['monitors']
+        any_show = any(transform.is_slideshow(mons.get(k))
+                       for k in self.selected)
+        self._syncing = True
+        self.type_switch.set_sensitive(bool(self.selected))
+        (self.type_show if any_show else self.type_single).set_active(True)
+        self._syncing = False
+        show = self.ss_entry()
+        self.ss_box.set_sensitive(bool(show))
+        if show is None:
+            self.ss_hint.set_text(
+                'Select one monitor set to Slideshow to edit its slideshow.'
+                if any_show else 'Switch a monitor to Slideshow (above) to '
+                'build a slideshow of photos and videos.')
+            self.ss_hint.show()
+        elif not show.get('items'):
+            self.ss_hint.set_text('Empty: click library items to add them.')
+            self.ss_hint.show()
+        else:
+            self.ss_hint.hide()
+        self._ss_rebuild()
+        self._syncing = True
+        if show:
+            self.ss_trans.set_active_id(show.get('transition', 'fade'))
+            self.ss_adj['transition_time'].set_value(
+                show.get('transition_time', 1.0))
+            self.ss_adj['photo_duration'].set_value(
+                show.get('photo_duration', 10.0))
+            self.ss_shuffle.set_active(bool(show.get('shuffle')))
+        wp = self.edit_wp(self.ss_key()) if show else None
+        self.ss_item_row.set_sensitive(bool(wp))
+        if wp and media.kind(wp['path']) == 'video':
+            self.ss_item_label.set_text('Selected video: play')
+            self.ss_item_adj.configure(transform.video_plays(wp), 1, 100,
+                                       1, 5, 0)
+            self.ss_item_spin.set_digits(0)
+            self.ss_item_unit.set_text('time(s), then move on')
+        else:
+            self.ss_item_label.set_text('Selected photo: show for')
+            self.ss_item_adj.configure(float(wp.get('duration') or 0)
+                                       if wp else 0, 0, 3600, 1, 10, 0)
+            self.ss_item_spin.set_digits(1)
+            self.ss_item_unit.set_text('s (0 = photo duration)')
+        self._syncing = False
+
     def sync_controls(self):
         """Refresh the control panel from the selected monitors."""
         n = len(self.selected)
@@ -941,8 +1377,13 @@ class WallpaperGui(Gtk.ApplicationWindow):
         for w in self.controls:
             w.set_sensitive(has)
         self.sync_video()
+        self.sync_slideshow()
         if not has:
-            self.wp_label.set_text('No wallpaper: pick one from the library')
+            show = self.ss_entry()
+            self.wp_label.set_text(
+                'Slideshow: select an item in the Slideshow tab to adjust it'
+                if show and show.get('items') else
+                'No wallpaper: pick one from the library')
             self._select_library_item(None)
             return
         wp = wps[0]
@@ -989,12 +1430,14 @@ class WallpaperGui(Gtk.ApplicationWindow):
         self.changed()
 
     def _copy_to_all(self, _b):
-        wps = self.selected_wps()
-        if not wps:
+        mons = self.profile()['monitors']
+        src = next((mons[k] for k in sorted(self.selected) if k in mons),
+                   None)
+        if not src:
             return
-        src = wps[0]
         for m in self.monitors:
-            self.profile()['monitors'][m['key']] = dict(src)
+            if mons.get(m['key']) is not src:
+                mons[m['key']] = config.clone(src)
         self._status(f"Copied to all {len(self.monitors)} monitors.")
         self.changed()
 
@@ -1058,8 +1501,9 @@ class WallpaperGui(Gtk.ApplicationWindow):
         item = self.items.get(path)
         if item and result:
             item.set_thumb(result[0])
-        if any(w['path'] == path for w in self.profile()['monitors'].values()):
+        if path in set(self.all_paths()):
             self.layout.queue_draw()
+            self._ss_thumb(path, result)
 
     def _select_library_item(self, path):
         item = self.items.get(path) if path else None
@@ -1099,12 +1543,20 @@ class WallpaperGui(Gtk.ApplicationWindow):
     def _add_folder(self, _b):
         self._browse()
 
-    def _assign(self, path, keys):
+    def _assign(self, path, keys, replace=False):
+        """Put path on these monitors; slideshows get it appended instead
+        (unless replace=True)."""
         mons = self.profile()['monitors']
         for k in keys:
+            entry = mons.get(k)
             wp = transform.new_wallpaper(path)
-            if k in mons:
-                wp['mode'] = mons[k]['mode']
+            if transform.is_slideshow(entry) and not replace:
+                entry.setdefault('items', []).append(wp)
+                if k == self.ss_key():
+                    self.ss_item = len(entry['items']) - 1
+                continue
+            if entry and not transform.is_slideshow(entry):
+                wp['mode'] = entry['mode']
             mons[k] = wp
         self.sync_controls()
         self.changed()
@@ -1124,10 +1576,15 @@ class WallpaperGui(Gtk.ApplicationWindow):
             mi = Gtk.MenuItem(label=label)
             mi.connect('activate', lambda _m: cb())
             menu.append(mi)
+        if self.ss_key():
+            add('Add to slideshow',
+                lambda: self._assign(item.path, [self.ss_key()]))
         add('Set on all monitors',
-            lambda: self._assign(item.path, [m['key'] for m in self.monitors]))
+            lambda: self._assign(item.path, [m['key'] for m in self.monitors],
+                                 replace=True))
         add('Open containing folder', lambda: subprocess.Popen(
-            ['xdg-open', os.path.dirname(item.path)]))
+            ['xdg-open', os.path.dirname(item.path)],
+            env=config.child_env()))
         menu.append(Gtk.SeparatorMenuItem())
         if item.source == item.path:
             add('Remove from library', lambda: self._remove_source(item.source))
@@ -1138,6 +1595,42 @@ class WallpaperGui(Gtk.ApplicationWindow):
         menu.attach_to_widget(self, None)
         menu.popup_at_pointer(ev)
         return True
+
+    # ---- files handed over by other apps (see app.py) ------------------
+    def library_added(self, path):
+        """The app added path to the saved library; show it here too."""
+        if path not in self.edit['library']:
+            self.edit['library'].append(path)
+            self.reload_library()
+            self.sync_controls()
+
+    def adopt_profile(self, profile):
+        """A profile was created and activated outside the editor (e.g.
+        "Set as Wallpaper" in a file manager): add it and switch to it,
+        keeping any unsaved edits to the other profiles."""
+        self.edit['profiles'].append(profile)
+        self.edit['active_profile'] = profile['id']
+        self.ss_item = None
+        self.refresh_profiles()
+        self.sync_controls()
+        self.changed()
+        self._status(f'New profile “{profile["name"]}”')
+
+    def add_to_selected(self, path):
+        """Put path on the selected monitors, as if it was clicked in the
+        library. Returns an error message or None."""
+        if not self.selected:
+            return 'Select a monitor first.'
+        self.app.add_to_library(path)
+        self._assign(path, self.selected)
+        self._select_library_item(path)
+        names = ', '.join(sorted(self.selected))
+        self._status(f'{os.path.basename(path)} → {names}. '
+                     'Press OK to keep it.')
+        return None
+
+    def show_status(self, text):
+        self._status(text)
 
     def _remove_source(self, source):
         if source in self.edit['library']:
@@ -1177,6 +1670,13 @@ class WallpaperGui(Gtk.ApplicationWindow):
         return False
 
     def _on_destroy(self, _w):
+        if self._snap_anim:
+            GLib.source_remove(self._snap_anim)
+            self._snap_anim = 0
+        # Remember where the library divider was (UI state, not a setting,
+        # so it's saved even on Cancel).
+        self.app.cfg.setdefault('gui', {})['split'] = self.split.get_position()
+        config.save(self.app.cfg)
         if self._live_pending:
             GLib.source_remove(self._live_pending)
             self._live_pending = 0
