@@ -130,7 +130,7 @@ Nothing personal is written into this folder:
 - Desktop Icons NG lowers its windows to the bottom whenever they're
   clicked. On X11 UWP sees that through libwnck and lowers itself again. On
   Wayland the icon windows are invisible to UWP, so the helper extension
-  does it from inside GNOME Shell before the next frame is drawn.
+  does it from inside GNOME Shell within the same frame.
 - Images are drawn once with Cairo.
 - Videos play through GStreamer: hardware decoding, then `gltransformation`
   for scale and rotation on the GPU, then `glimagesink`. Looping uses

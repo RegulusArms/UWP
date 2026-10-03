@@ -584,19 +584,44 @@ _HELPER = ('org.gnome.Shell', '/io/github/RegulusArms/UWP/Helper',
 _helper_seen = None
 
 
+def _helper_call_args(keys):
+    return (_HELPER[0], _HELPER[1], _HELPER[2], 'GetCovered',
+            GLib.Variant('(as)', (list(keys),)), GLib.VariantType('(as)'),
+            Gio.DBusCallFlags.NONE, 500)
+
+
 def helper_covered(keys):
     """Monitors (of keys) covered by maximized/fullscreen windows, as seen
     by the UWP GNOME Shell helper extension, or None if it isn't running.
-    Unlike libwnck it sees native Wayland windows too."""
-    global _helper_seen
+    Unlike libwnck it sees native Wayland windows too. Blocks; see
+    helper_covered_async() for anything periodic."""
     try:
         bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-        out = bus.call_sync(
-            _HELPER[0], _HELPER[1], _HELPER[2], 'GetCovered',
-            GLib.Variant('(as)', (list(keys),)), GLib.VariantType('(as)'),
-            Gio.DBusCallFlags.NONE, 500, None).unpack()[0]
+        out = bus.call_sync(*_helper_call_args(keys), None).unpack()[0]
     except GLib.Error:
         out = None
+    return _helper_result(out)
+
+
+def helper_covered_async(keys, callback):
+    """helper_covered() without blocking: callback(result) runs later in
+    the main loop, so a busy GNOME Shell can't stall our animations."""
+    def done(bus, res):
+        try:
+            out = bus.call_finish(res).unpack()[0]
+        except GLib.Error:
+            out = None
+        callback(_helper_result(out))
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    except GLib.Error:
+        callback(_helper_result(None))
+        return
+    bus.call(*_helper_call_args(keys), None, done)
+
+
+def _helper_result(out):
+    global _helper_seen
     if (out is not None) != _helper_seen:
         _helper_seen = out is not None
         log(f'GNOME Shell helper extension {HELPER_UUID}: '
@@ -651,7 +676,8 @@ class StackKeeper:
         self._helper_check -= self.POLL_MS
         if self._helper_check <= 0:
             self._helper_check = 5000
-            self._helper = helper_covered([]) is not None
+            helper_covered_async([], lambda out: setattr(
+                self, '_helper', out is not None))
         if not self._helper:
             ours = self._ours()
             if ours:
@@ -715,6 +741,7 @@ class CoverWatcher:
         self.last = None
         self.Wnck, self.screen = wnck_screen()
         self.wayland = on_wayland()
+        self._asking = False
         if self.screen is not None or self.wayland:
             GLib.timeout_add(1000, self._tick)
 
@@ -728,23 +755,31 @@ class CoverWatcher:
             self.callback(set())
 
     def _tick(self):
-        if self.enabled:
-            covered = self._compute()
-            if covered != self.last:
-                self.last = covered
-                self.callback(covered)
-        return True
-
-    def _compute(self):
+        if not self.enabled:
+            return True
         if self.wayland:
             # Only the helper extension sees native Wayland windows; without
             # it libwnck still catches X11 (XWayland) apps.
-            covered = helper_covered([m['key'] for m in monitors()])
-            if covered is not None:
-                return covered
-            if self.screen is None:
-                return set()
-        return self._compute_wnck()
+            if not self._asking:
+                self._asking = True
+                helper_covered_async([m['key'] for m in monitors()],
+                                     self._helper_answered)
+        else:
+            self._report(self._compute_wnck())
+        return True
+
+    def _helper_answered(self, covered):
+        self._asking = False
+        if not self.enabled:
+            return
+        if covered is None:
+            covered = set() if self.screen is None else self._compute_wnck()
+        self._report(covered)
+
+    def _report(self, covered):
+        if covered != self.last:
+            self.last = covered
+            self.callback(covered)
 
     def _compute_wnck(self):
         Wnck = self.Wnck

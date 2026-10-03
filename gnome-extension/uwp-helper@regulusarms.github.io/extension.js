@@ -4,8 +4,9 @@
 // lowers them to the bottom every time they are raised, i.e. on every click,
 // which drops the icons and their menus under the wallpaper. UWP can't see
 // Wayland windows to undo that, so this runs inside GNOME Shell: after any
-// restack, before the next frame is drawn, it moves UWP's windows back to the
-// very bottom. On X11 UWP does this itself; this just does it sooner.
+// restack it moves UWP's windows back to the very bottom, and reorders their
+// actors at once so the frame being drawn never shows the icons underneath.
+// On X11 UWP does this itself; this just does it sooner.
 //
 // It also answers which monitors are covered by maximized or fullscreen
 // windows (D-Bus, below), since GNOME doesn't list Wayland windows to apps.
@@ -37,42 +38,29 @@ function isMaximized(w) {
         w.get_maximized() === Meta.MaximizeFlags.BOTH;
 }
 
-function laters() {
-    return global.compositor.get_laters();
-}
-
 export default class UwpHelper extends Extension {
     enable() {
-        this._later = 0;
-        global.display.connectObject('restacked', () => this._queue(), this);
+        global.display.connectObject('restacked', () => this._restack(), this);
         this._dbus = Gio.DBusExportedObject.wrapJSObject(IFACE, this);
         this._dbus.export(Gio.DBus.session, OBJECT_PATH);
-        this._queue();
+        this._restack();
     }
 
     disable() {
         global.display.disconnectObject(this);
-        if (this._later)
-            laters().remove(this._later);
-        this._later = 0;
         this._dbus.unexport();
         this._dbus = null;
     }
 
     get Version() {
-        return 1;
+        return 2;
     }
 
-    _queue() {
-        if (this._later)
-            return;
-        this._later = laters().add(Meta.LaterType.BEFORE_REDRAW, () => {
-            this._later = 0;
-            this._restack();
-            return false;
-        });
-    }
-
+    // 'restacked' is emitted after mutter has already put the window actors
+    // in the new order for the frame being drawn. A lower() now only reaches
+    // the actors at the next frame's stack sync, so the actors are moved here
+    // too; otherwise every DING lower() (each click on the desktop, each
+    // window mapped anywhere) shows one frame with the icons hidden.
     _restack() {
         const desktop = global.display.sort_windows_by_stacking(
             global.display.list_all_windows()).filter(
@@ -83,8 +71,17 @@ export default class UwpHelper extends Extension {
             return;   // ours are already the bottom-most desktop windows
         // Lowering each to the bottom, top one first, keeps their order.
         // That restacks again, and the check above then finds nothing to do.
-        for (const w of ours.reverse())
+        for (const w of [...ours].reverse())
             w.lower();
+        const below = desktop[foreign].get_compositor_private();
+        const parent = below?.get_parent();
+        if (!parent)
+            return;
+        for (const w of ours) {
+            const actor = w.get_compositor_private();
+            if (actor?.get_parent() === parent)
+                parent.set_child_below_sibling(actor, below);
+        }
     }
 
     // Same rule as renderer.CoverWatcher: a monitor is covered when a
