@@ -1,17 +1,21 @@
 // UWP's wallpapers are X11 desktop-type windows (XWayland on Wayland).
 //
-// On Wayland, Desktop Icons NG makes its own windows desktop-type too and
-// lowers them to the bottom every time they are raised, i.e. on every click,
-// which drops the icons and their menus under the wallpaper. UWP can't see
-// Wayland windows to undo that, so this runs inside GNOME Shell: after any
-// restack it moves UWP's windows back to the very bottom, and reorders their
-// actors at once so the frame being drawn never shows the icons underneath.
-// On X11 UWP does this itself; this just does it sooner.
+// Desktop Icons NG makes its own windows desktop-type too and lowers them to
+// the bottom whenever anything happens: a click on the desktop, any window
+// mapped or closed (each slideshow change maps one of ours and unmaps
+// another). Fighting that by lowering ours again after every restack always
+// left a frame with the icons hidden under the wallpaper. Instead, this runs
+// inside GNOME Shell and moves our window actors into a background group of
+// their own, just above GNOME's background. Mutter keeps background groups
+// below every window actor, so the icons are drawn on top (and get the
+// clicks) whatever the window stacking order is. Mutter still orders our
+// windows among themselves, which the slideshow layers rely on.
 //
 // It also answers which monitors are covered by maximized or fullscreen
 // windows (D-Bus, below), since GNOME doesn't list Wayland windows to apps.
 import Gio from 'gi://Gio';
 import Meta from 'gi://Meta';
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const WALLPAPER_TITLE = 'UWP wallpaper ';   // renderer.MonitorWindow
@@ -40,48 +44,54 @@ function isMaximized(w) {
 
 export default class UwpHelper extends Extension {
     enable() {
-        global.display.connectObject('restacked', () => this._restack(), this);
+        // A Meta.BackgroundGroup, so mutter's stack sync keeps it with the
+        // backgrounds, under all windows.
+        this._group = new Meta.BackgroundGroup({name: 'uwp-wallpapers'});
+        global.window_group.insert_child_above(this._group,
+            Main.layoutManager._backgroundGroup);
+        // 'map' comes before the window's first frame is drawn; the others
+        // catch anything mapped before enable() or retitled later.
+        global.window_manager.connectObject(
+            'map', (_wm, actor) => this._adopt(actor.get_meta_window()), this);
+        global.display.connectObject(
+            'window-created', (_d, w) => this._adopt(w),
+            'restacked', () => this._adoptAll(), this);
         this._dbus = Gio.DBusExportedObject.wrapJSObject(IFACE, this);
         this._dbus.export(Gio.DBus.session, OBJECT_PATH);
-        this._restack();
+        this._adoptAll();
     }
 
     disable() {
+        global.window_manager.disconnectObject(this);
         global.display.disconnectObject(this);
         this._dbus.unexport();
         this._dbus = null;
+        for (const actor of [...this._group.get_children()]) {
+            this._group.remove_child(actor);
+            global.window_group.add_child(actor);
+        }
+        this._group.destroy();
+        this._group = null;
     }
 
     get Version() {
-        return 2;
+        return 3;
     }
 
-    // 'restacked' is emitted after mutter has already put the window actors
-    // in the new order for the frame being drawn. A lower() now only reaches
-    // the actors at the next frame's stack sync, so the actors are moved here
-    // too; otherwise every DING lower() (each click on the desktop, each
-    // window mapped anywhere) shows one frame with the icons hidden.
-    _restack() {
-        const desktop = global.display.sort_windows_by_stacking(
-            global.display.list_all_windows()).filter(
-            w => w.get_window_type() === Meta.WindowType.DESKTOP);
-        const ours = desktop.filter(isWallpaper);   // bottom to top
-        const foreign = desktop.findIndex(w => !isWallpaper(w));
-        if (foreign < 0 || foreign >= ours.length)
-            return;   // ours are already the bottom-most desktop windows
-        // Lowering each to the bottom, top one first, keeps their order.
-        // That restacks again, and the check above then finds nothing to do.
-        for (const w of [...ours].reverse())
-            w.lower();
-        const below = desktop[foreign].get_compositor_private();
-        const parent = below?.get_parent();
-        if (!parent)
+    _adopt(w) {
+        if (!w || !isWallpaper(w))
             return;
-        for (const w of ours) {
-            const actor = w.get_compositor_private();
-            if (actor?.get_parent() === parent)
-                parent.set_child_below_sibling(actor, below);
-        }
+        const actor = w.get_compositor_private();
+        const parent = actor?.get_parent();
+        if (!parent || parent === this._group)
+            return;
+        parent.remove_child(actor);
+        this._group.add_child(actor);
+    }
+
+    _adoptAll() {
+        for (const w of global.display.list_all_windows())
+            this._adopt(w);
     }
 
     // Same rule as renderer.CoverWatcher: a monitor is covered when a

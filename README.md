@@ -131,9 +131,12 @@ Nothing personal is written into this folder:
   GStreamer onto X11 and hides `WAYLAND_DISPLAY` from its own process (apps it
   opens get it back).
 - Desktop Icons NG lowers its windows to the bottom whenever they're
-  clicked. On X11 UWP sees that through libwnck and lowers itself again. On
-  Wayland the icon windows are invisible to UWP, so the helper extension
-  does it from inside GNOME Shell within the same frame.
+  clicked, and whenever any window opens or closes. Rather than lowering
+  the wallpaper again each time (which always showed a frame without
+  icons), the helper extension moves UWP's window actors into a background
+  group of their own inside GNOME Shell, which is drawn under every window
+  whatever the stacking order. Without the extension, UWP lowers itself
+  again (via libwnck on X11, by polling on Wayland).
 - Images are drawn once with Cairo.
 - Videos play through GStreamer: hardware decoding, then `gltransformation`
   for scale and rotation on the GPU, then `glimagesink`. Looping uses
