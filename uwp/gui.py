@@ -428,6 +428,30 @@ class SettingsDialog(Gtk.Dialog):
             'autostart', b.get_active()))
         grid.attach(auto, 0, row, 2, 1)
         row += 1
+        if renderer.blur_my_shell_installed():
+            heading('GPU memory')
+            grid.attach(Gtk.Label(xalign=0, wrap=True, hexpand=True, label=(
+                'blur-my-shell keeps the video memory of closed windows. '
+                'UWP resets it on profile switches and on quit; this does '
+                'it now.')), 0, row, 1, 1)
+            reset = Gtk.Button(label='Reset blur-my-shell')
+            grid.attach(reset, 1, row, 1, 1)
+            row += 1
+            status = Gtk.Label(xalign=0)
+            status.get_style_context().add_class('dim-label')
+            grid.attach(status, 0, row, 2, 1)
+            row += 1
+
+            def reset_done(ok):
+                reset.set_sensitive(True)
+                status.set_text('Reset: GPU memory freed.' if ok else
+                                'blur-my-shell is not running.')
+
+            def clicked(_b):
+                reset.set_sensitive(False)
+                status.set_text('Resetting…')
+                gui.app.reset_blur(reset_done)
+            reset.connect('clicked', clicked)
         note = Gtk.Label(xalign=0, wrap=True, label=(
             'Changes take effect when you press OK in the main window.'))
         note.get_style_context().add_class('dim-label')

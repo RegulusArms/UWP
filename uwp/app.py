@@ -16,6 +16,10 @@ from gi.repository import Gdk, Gio, GLib, Gst, Gtk
 from . import config, keybind, media, renderer, transform
 from .keybind import APP_ID
 
+# Wait after closing windows before resetting blur-my-shell, so GNOME Shell
+# has dropped them by then.
+BLUR_RESET_SETTLE_MS = 300
+
 AUTOSTART_PATH = os.path.join(os.path.dirname(config.CONFIG_DIR), 'autostart',
                               APP_ID + '.desktop')
 
@@ -32,6 +36,8 @@ class App(Gtk.Application):
         self.gui = None
         self._first = True
         self._reapply_id = 0
+        self._blur_reset_id = 0
+        self._quitting = False
         opts = (('open', 'Open the settings window'),
                 ('background', 'Start in the tray without opening the window'),
                 ('next-profile', 'Switch to the next profile'),
@@ -141,11 +147,51 @@ class App(Gtk.Application):
         return 0
 
     def quit_app(self):
+        """Close all wallpaper windows, then reset blur-my-shell so the
+        VRAM it kept for them is freed, then exit."""
+        if self._quitting:
+            return
+        self._quitting = True
         if self.gui:
             self.gui.destroy()
-        self.desktop.shutdown()
+        if self._blur_reset_id:
+            GLib.source_remove(self._blur_reset_id)
+            self._blur_reset_id = 0
+        self.desktop.shutdown(done=lambda: GLib.timeout_add(
+            BLUR_RESET_SETTLE_MS, self._quit_reset))
+
+    def _quit_reset(self):
+        renderer.reset_blur_my_shell(lambda _ok: self._exit())
+        return False
+
+    def _exit(self):
         self.release()
         self.quit()
+
+    # ---- GPU memory ------------------------------------------------------
+    def reset_blur(self, done=None):
+        """Restart blur-my-shell to free the VRAM it holds. done(ok) gets
+        the result; without it the user is told by a notification."""
+        def finished(ok):
+            if done:
+                done(ok)
+            elif ok:
+                self.notify('GPU memory freed', 'blur-my-shell was reset.')
+            else:
+                self.notify('Nothing to reset', 'blur-my-shell is not running.')
+        renderer.reset_blur_my_shell(finished)
+
+    def _schedule_blur_reset(self):
+        """Reset blur-my-shell once the windows a profile switch closed are
+        gone (videos stop on a worker thread). Quick switches reset once."""
+        if self._blur_reset_id:
+            GLib.source_remove(self._blur_reset_id)
+        self._blur_reset_id = GLib.timeout_add(1500, self._blur_reset_due)
+
+    def _blur_reset_due(self):
+        self._blur_reset_id = 0
+        renderer.reset_blur_my_shell(lambda _ok: None)
+        return False
 
     # ---- profiles ------------------------------------------------------
     def set_profile(self, pid, notify=True):
@@ -156,6 +202,7 @@ class App(Gtk.Application):
         config.save(self.cfg)
         self.desktop.apply(p)
         self.tray.refresh()
+        self._schedule_blur_reset()
         if notify:
             n = Gio.Notification.new('Wallpaper profile')
             n.set_body(p['name'])

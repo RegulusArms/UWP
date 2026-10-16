@@ -607,10 +607,36 @@ class Desktop:
     def has_video(self):
         return any(w.is_video() for w in self.windows.values())
 
-    def shutdown(self):
-        for win in self.windows.values():
-            win.destroy_output()
+    def shutdown(self, done=None):
+        """Close every wallpaper window. done() runs once all of them are
+        destroyed (videos stop on a worker thread first), or after 3 s if a
+        pipeline is stuck."""
+        wins = [w for out in self.windows.values()
+                for w in out.stack_windows()]
+        pending = set(wins)
+        finished = False
+
+        def finish():
+            nonlocal finished
+            if not finished and done:
+                finished = True
+                Gdk.Display.get_default().sync()
+                done()
+            return False
+
+        def gone(win):
+            pending.discard(win)
+            if not pending:
+                finish()
+        for win in wins:
+            win.connect('destroy', gone)
+        for out in self.windows.values():
+            out.destroy_output()
         self.windows.clear()
+        if not wins:
+            finish()
+        elif done:
+            GLib.timeout_add(3000, finish)
 
 
 def on_wayland():
@@ -668,6 +694,59 @@ def _helper_result(out):
         log(f'GNOME Shell helper extension {HELPER_UUID}: '
             + ('active' if _helper_seen else 'not running'))
     return set(out) if out is not None else None
+
+
+BLUR_UUID = 'blur-my-shell@aunetx'
+_EXTENSIONS = ('org.gnome.Shell.Extensions', '/org/gnome/Shell/Extensions',
+               'org.gnome.Shell.Extensions')
+
+
+def blur_my_shell_installed():
+    dirs = [os.path.join(GLib.get_user_data_dir(), 'gnome-shell',
+                         'extensions')]
+    dirs += [os.path.join(d, 'gnome-shell', 'extensions')
+             for d in GLib.get_system_data_dirs()]
+    return any(os.path.isdir(os.path.join(d, BLUR_UUID)) for d in dirs)
+
+
+def _extension_call(method, reply, callback):
+    """org.gnome.Shell.Extensions method on blur-my-shell, without blocking;
+    callback(unpacked reply, or None on error)."""
+    def done(bus, res):
+        try:
+            out = bus.call_finish(res).unpack()[0]
+        except GLib.Error as e:
+            log(f'{method} {BLUR_UUID}: {e.message}')
+            out = None
+        callback(out)
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    except GLib.Error:
+        callback(None)
+        return
+    bus.call(*_EXTENSIONS, method, GLib.Variant('(s)', (BLUR_UUID,)),
+             GLib.VariantType(reply), Gio.DBusCallFlags.NONE, 5000, None,
+             done)
+
+
+def reset_blur_my_shell(callback):
+    """Disable and re-enable the blur-my-shell extension, which frees the
+    VRAM it holds: it keeps the GPU textures of closed windows until it is
+    restarted. callback(ok) runs afterwards; ok is False if it wasn't
+    running (then nothing is touched)."""
+    def info(out):
+        # ExtensionState.ACTIVE (named ENABLED before GNOME 46) is 1.
+        if not out or out.get('state') != 1:
+            callback(False)
+            return
+        _extension_call('DisableExtension', '(b)', lambda _ok: (
+            _extension_call('EnableExtension', '(b)', enabled)))
+
+    def enabled(ok):
+        log('blur-my-shell restarted to free its GPU memory' if ok
+            else 'blur-my-shell could not be re-enabled')
+        callback(bool(ok))
+    _extension_call('GetExtensionInfo', '(a{sv})', info)
 
 
 _wnck = None

@@ -4,6 +4,8 @@ import os
 import gi
 from gi.repository import Gtk
 
+from . import renderer
+
 try:
     gi.require_version('AyatanaAppIndicator3', '0.1')
     from gi.repository import AyatanaAppIndicator3 as AppIndicator
@@ -64,6 +66,10 @@ class Tray:
         pause.connect('toggled', lambda m: self.app.desktop.set_user_paused(
             m.get_active()))
         menu.append(pause)
+        if renderer.blur_my_shell_installed():
+            reset = Gtk.MenuItem(label='Free GPU memory (reset blur-my-shell)')
+            reset.connect('activate', lambda _m: self.app.reset_blur())
+            menu.append(reset)
         quit_item = Gtk.MenuItem(label='Quit')
         quit_item.connect('activate', lambda _m: self.app.quit_app())
         menu.append(quit_item)
