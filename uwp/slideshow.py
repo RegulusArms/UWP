@@ -282,15 +282,23 @@ class SlideshowPlayer:
         layer.set_clip(None, 0, 0, 0)
         layer.set_opacity(1.0)
 
+    def _park(self, layer):
+        """Hide layer but keep it mapped. Unmapping and remapping a
+        full-screen window on every slide makes GNOME Shell (with
+        blur-my-shell) leak each window's texture in VRAM, and makes Desktop
+        Icons NG restack. Transparent first, then cleared, so it never shows
+        black on top."""
+        layer.set_opacity(0.0)
+        layer.set_clip(None, 0, 0, 0)
+        layer.clear()
+
     def _hold(self, item, keep):
         """GUI live preview of one item: show it, no timers."""
         self._stop()
         self.static = True
         self.sig = None
         other = self.layers[1 - self.cur]
-        if other.get_mapped():
-            self._reset_layer(other)
-            other.hide()
+        self._park(other)
         layer = self.layers[self.cur]
         layer.set_clip(None, 0, 0, 0)
         layer.set_opacity(1.0)
@@ -309,9 +317,8 @@ class SlideshowPlayer:
         if entry.get('shuffle'):
             random.shuffle(self.order)
         self.pos = 0
-        for layer in self.layers:
-            self._reset_layer(layer)
-        self.layers[1 - self.cur].hide()
+        self._park(self.layers[1 - self.cur])
+        self._reset_layer(self.layers[self.cur])
         item = self._item()
         self._load(self.layers[self.cur], item, playing=True)
         length = self._length(item)
@@ -407,13 +414,11 @@ class SlideshowPlayer:
         if self._transition_time() <= 0:
             kind = 'none'
         self.transition = kind
-        layer = self.layers[1 - self.cur]
-        self._reset_layer(layer)
+        layer = self.layers[1 - self.cur]      # parked: transparent
         layer.realize()
         if kind.startswith('wipe'):
-            layer.set_clip(0, 0, 0, 0)          # fully clipped, opaque
-        else:
-            layer.set_opacity(0.0)
+            layer.set_clip(0, 0, 0, 0)          # fully clipped, then opaque
+            layer.set_opacity(1.0)
         self._load(layer, item, playing=False, surface=surface)
         self.prepared = nxt
         self.desktop.stack.schedule()
@@ -485,8 +490,7 @@ class SlideshowPlayer:
         inc.set_clip(None, 0, 0, 0)
         if isinstance(inc.view, VideoView):
             inc.view.pause(self.hold_videos)
-        self._reset_layer(out)
-        out.hide()
+        self._park(out)
         self.cur = 1 - self.cur
         self.pos = self.prepared if self.prepared is not None \
             else self._next_pos()
