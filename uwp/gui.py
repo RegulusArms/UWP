@@ -442,16 +442,32 @@ class SettingsDialog(Gtk.Dialog):
             grid.attach(status, 0, row, 2, 1)
             row += 1
 
+            busy = False
+
+            def state(active):
+                # Greyed out while blur-my-shell is disabled.
+                if not busy:
+                    reset.set_sensitive(active)
+                    status.set_text('' if active else
+                                    'blur-my-shell is disabled.')
+
             def reset_done(ok):
-                reset.set_sensitive(True)
+                nonlocal busy
+                busy = False
+                reset.set_sensitive(ok or gui.app.blur_active)
                 status.set_text('Reset: GPU memory freed.' if ok else
-                                'blur-my-shell is not running.')
+                                'blur-my-shell is disabled.')
 
             def clicked(_b):
+                nonlocal busy
+                busy = True
                 reset.set_sensitive(False)
                 status.set_text('Resetting…')
                 gui.app.reset_blur(reset_done)
             reset.connect('clicked', clicked)
+            state(gui.app.blur_active)
+            unwatch = renderer.watch_blur_my_shell(state)
+            self.connect('destroy', lambda _d: unwatch())
         note = Gtk.Label(xalign=0, wrap=True, label=(
             'Changes take effect when you press OK in the main window.'))
         note.get_style_context().add_class('dim-label')

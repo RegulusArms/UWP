@@ -161,6 +161,16 @@ total.
   counts `DP-0`, `DP-2`...), so on GNOME UWP also records each monitor's
   EDID and moves profile entries to the right connector when names change.
   Two identical monitors with the same serial can't be told apart this way.
+- **Known bug with the Blur my Shell extension: disable it while UWP
+  runs.** Blur my Shell keeps the GPU memory of every window that closes,
+  until the extension is restarted, so GNOME Shell's VRAM use keeps growing
+  (several GB over a few hours of slideshows on several monitors). UWP
+  keeps its slideshow windows open to avoid most of this, and restarts Blur
+  my Shell when you switch profiles and when you quit. You can also restart
+  it from the tray (*Free GPU memory*) or from *Shortcuts & settings*. Each
+  restart briefly drops the panel and overview blur. The leak is in Blur my
+  Shell, so other apps that open and close windows still add to it. To
+  avoid it entirely, run `gnome-extensions disable blur-my-shell@aunetx`.
 - Don't use Ctrl+Alt+F1–F12 or Ctrl+Alt+Backspace/Delete as shortcuts: the
   system acts on those before GNOME (for example, switching to a text
   console). UWP refuses them.

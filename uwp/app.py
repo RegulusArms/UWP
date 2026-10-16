@@ -89,6 +89,11 @@ class App(Gtk.Application):
         self.add_selected_action.set_enabled(False)
         self.add_action(self.add_selected_action)
 
+        # Whether blur-my-shell runs: its reset buttons grey out and
+        # profile switches skip the reset while it doesn't.
+        self.blur_active = (renderer.blur_my_shell_installed()
+                            and renderer.blur_my_shell_active())
+        renderer.watch_blur_my_shell(self._blur_changed)
         from .tray import Tray
         self.tray = Tray(self)
         self.cover = renderer.CoverWatcher(self.desktop.set_covered)
@@ -181,16 +186,24 @@ class App(Gtk.Application):
                 self.notify('Nothing to reset', 'blur-my-shell is not running.')
         renderer.reset_blur_my_shell(finished)
 
+    def _blur_changed(self, active):
+        if active != self.blur_active:
+            self.blur_active = active
+            self.tray.refresh()
+
     def _schedule_blur_reset(self):
         """Reset blur-my-shell once the windows a profile switch closed are
         gone (videos stop on a worker thread). Quick switches reset once."""
+        if not self.blur_active:
+            return
         if self._blur_reset_id:
             GLib.source_remove(self._blur_reset_id)
         self._blur_reset_id = GLib.timeout_add(1500, self._blur_reset_due)
 
     def _blur_reset_due(self):
         self._blur_reset_id = 0
-        renderer.reset_blur_my_shell(lambda _ok: None)
+        if self.blur_active:
+            renderer.reset_blur_my_shell(lambda _ok: None)
         return False
 
     # ---- profiles ------------------------------------------------------

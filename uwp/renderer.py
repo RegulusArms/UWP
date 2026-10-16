@@ -729,14 +729,45 @@ def _extension_call(method, reply, callback):
              done)
 
 
+def _blur_state_active(info):
+    # ExtensionState.ACTIVE (named ENABLED before GNOME 46) is 1.
+    return bool(info) and info.get('state') == 1
+
+
+def blur_my_shell_active():
+    """True if the blur-my-shell extension is running. Blocks briefly."""
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        out = bus.call_sync(*_EXTENSIONS, 'GetExtensionInfo',
+                            GLib.Variant('(s)', (BLUR_UUID,)),
+                            GLib.VariantType('(a{sv})'),
+                            Gio.DBusCallFlags.NONE, 1000, None).unpack()[0]
+    except GLib.Error:
+        return False
+    return _blur_state_active(out)
+
+
+def watch_blur_my_shell(callback):
+    """callback(active) whenever blur-my-shell is enabled or disabled.
+    Returns a function that stops watching."""
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    except GLib.Error:
+        return lambda: None
+    sid = bus.signal_subscribe(
+        _EXTENSIONS[0], _EXTENSIONS[2], 'ExtensionStateChanged',
+        _EXTENSIONS[1], BLUR_UUID, Gio.DBusSignalFlags.NONE,
+        lambda *a: callback(_blur_state_active(a[5].unpack()[1])))
+    return lambda: bus.signal_unsubscribe(sid)
+
+
 def reset_blur_my_shell(callback):
     """Disable and re-enable the blur-my-shell extension, which frees the
     VRAM it holds: it keeps the GPU textures of closed windows until it is
     restarted. callback(ok) runs afterwards; ok is False if it wasn't
     running (then nothing is touched)."""
     def info(out):
-        # ExtensionState.ACTIVE (named ENABLED before GNOME 46) is 1.
-        if not out or out.get('state') != 1:
+        if not _blur_state_active(out):
             callback(False)
             return
         _extension_call('DisableExtension', '(b)', lambda _ok: (

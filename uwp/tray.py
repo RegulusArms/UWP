@@ -69,6 +69,7 @@ class Tray:
         if renderer.blur_my_shell_installed():
             reset = Gtk.MenuItem(label='Free GPU memory (reset blur-my-shell)')
             reset.connect('activate', lambda _m: self.app.reset_blur())
+            reset.set_sensitive(self.app.blur_active)
             menu.append(reset)
         quit_item = Gtk.MenuItem(label='Quit')
         quit_item.connect('activate', lambda _m: self.app.quit_app())
