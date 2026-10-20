@@ -287,7 +287,9 @@ class SlideshowPlayer:
         full-screen window on every slide makes GNOME Shell (with
         blur-my-shell) leak each window's texture in VRAM, and makes Desktop
         Icons NG restack. Transparent first, then cleared, so it never shows
-        black on top."""
+        black on top. Realized first: GTK drops an opacity set before that,
+        and the window would first map opaque."""
+        layer.realize()
         layer.set_opacity(0.0)
         layer.set_clip(None, 0, 0, 0)
         layer.clear()
